@@ -10,6 +10,7 @@ from sky.backends import cloud_vm_ray_backend
 from sky.exceptions import ClusterDoesNotExist
 from sky.jobs import utils
 from sky.skylet import job_lib
+from sky.utils import message_utils
 
 # String path for mock.patch — can't use the constant directly because
 # mock.patch needs the dotted path to the attribute being patched.
@@ -139,6 +140,66 @@ async def test_get_job_status_returns_error_reason_on_failure(
     # No status logline is emitted when the fetch fails - the caller logs the
     # transient error reason instead.
     assert mock_logger.info.call_count == 0
+
+
+@pytest.mark.asyncio
+@mock.patch('sky.jobs.utils.logger')
+@mock.patch('sky.global_user_state.get_handle_from_cluster_name')
+async def test_get_job_status_empty_payload_is_transient(
+        mock_get_handle, mock_logger):
+    """An empty/sentinel-less status payload is a transient transport error.
+
+    On managed Kubernetes control planes the exec stream traverses a proxy
+    (e.g. konnectivity) that can drop stdout mid-stream while the remote
+    command exits 0, so decode_payload sees an empty string. This must not
+    escape as a fatal controller error (FAILED_CONTROLLER).
+    """
+    mock_handle = mock.MagicMock(
+        spec=cloud_vm_ray_backend.CloudVmRayResourceHandle)
+    mock_get_handle.return_value = mock_handle
+
+    mock_backend = mock.MagicMock(spec=cloud_vm_ray_backend.CloudVmRayBackend)
+
+    def failing_get_job_status(*args, **kwargs):
+        # Raise the genuine exception decode_payload produces for a
+        # truncated/empty exec stdout, to keep the message format authentic.
+        message_utils.decode_payload('')
+
+    mock_backend.get_job_status = failing_get_job_status
+
+    job_status, error_reason = await utils.get_job_status(
+        backend=mock_backend, cluster_name='test-cluster', job_id=1)
+
+    assert job_status is None, 'Expected None job status on failure'
+    assert error_reason is not None, 'Expected transient error reason'
+    assert 'payload' in error_reason
+
+    # No status logline is emitted when the fetch fails - the caller logs the
+    # transient error reason instead.
+    assert mock_logger.info.call_count == 0
+
+
+@pytest.mark.asyncio
+@mock.patch('sky.jobs.utils.logger')
+@mock.patch('sky.global_user_state.get_handle_from_cluster_name')
+async def test_get_job_status_unrelated_value_error_raises(
+        mock_get_handle, mock_logger):
+    """ValueErrors outside the transient allowlist must still propagate."""
+    mock_handle = mock.MagicMock(
+        spec=cloud_vm_ray_backend.CloudVmRayResourceHandle)
+    mock_get_handle.return_value = mock_handle
+
+    mock_backend = mock.MagicMock(spec=cloud_vm_ray_backend.CloudVmRayBackend)
+
+    def failing_get_job_status(*args, **kwargs):
+        raise ValueError('some unrelated error')
+
+    mock_backend.get_job_status = failing_get_job_status
+
+    with pytest.raises(ValueError, match='some unrelated error'):
+        await utils.get_job_status(backend=mock_backend,
+                                   cluster_name='test-cluster',
+                                   job_id=1)
 
 
 def _info_messages(mock_logger):

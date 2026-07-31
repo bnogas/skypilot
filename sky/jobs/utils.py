@@ -611,6 +611,19 @@ async def get_job_status(
             # sky/global_user_state.py get_cluster_yaml_dict.
             if re.search(r'Cluster yaml .* not found', str(e)):
                 potential_transient_error_reason = 'Cluster yaml was deleted'
+            elif 'Invalid payload string' in str(e):
+                # The job status poll runs a remote command whose stdout must
+                # contain a <sky-payload> sentinel (see
+                # message_utils.decode_payload). On managed Kubernetes control
+                # planes, the exec stream traverses a proxy (e.g.
+                # konnectivity), which can drop the stdout frames mid-stream
+                # while the command itself exits 0 — yielding an empty,
+                # sentinel-less payload. The remote job did not fail, so treat
+                # this like the other transient transport errors above; the
+                # surrounding retry window still bounds how long we tolerate
+                # it.
+                potential_transient_error_reason = (
+                    f'Empty or malformed job status payload: {e}')
             else:
                 raise
         elif isinstance(e, TypeError):
