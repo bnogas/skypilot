@@ -94,8 +94,8 @@ def _get_controller_url(service_name: str, controller_port: int) -> str:
 
     In single-pod (or daemon == controller pod) deployments the IP read from
     DB either matches our own POD_IP or is None — in both cases we fall back
-    to localhost. In HA where the request handler runs on a different pod
-    than the controller process, we route via the controller's pod IP from DB.
+    to localhost. When the request handler runs on a different pod than the
+    controller process, we route via the controller's pod IP from DB.
     """
     self_ip = os.environ.get('POD_IP')
     record = serve_state.get_service_from_name(service_name)
@@ -640,6 +640,27 @@ def generate_remote_config_yaml_file_name(service_name: str) -> str:
     return os.path.join(dir_name, 'config.yaml')
 
 
+def get_service_workspace(service_name: str) -> Optional[str]:
+    """The workspace the controller of a service runs for: the active
+    workspace of the config ``up`` placed next to the service's YAML, which
+    an update does not change. A config without one means the default
+    workspace. None when the file cannot be read: in consolidation mode it
+    may be gone after a pod restart, and a guess would be wrong either way.
+    """
+    path = os.path.expanduser(
+        generate_remote_config_yaml_file_name(service_name))
+    try:
+        config = yaml_utils.read_yaml(path)
+    except Exception:  # pylint: disable=broad-except
+        return None
+    if not isinstance(config, dict):
+        return None
+    workspace = config.get('active_workspace')
+    if not isinstance(workspace, str) or not workspace:
+        return skylet_constants.SKYPILOT_DEFAULT_WORKSPACE
+    return workspace
+
+
 def generate_remote_controller_log_file_name(service_name: str) -> str:
     dir_name = generate_remote_service_dir_name(service_name)
     # Don't expand here since it is used for remote machine.
@@ -872,6 +893,7 @@ def _get_service_status(
     if record['pool'] != pool:
         return None
 
+    record['workspace'] = get_service_workspace(service_name)
     record['pool_yaml'] = ''
     if record['pool']:
         version = record['version']
@@ -920,13 +942,38 @@ def _get_service_status(
         cluster_names = [info.cluster_name for info in replica_infos]
         cluster_records = global_user_state.get_clusters_from_names(
             cluster_names)
-        record['replica_info'] = [
-            info.to_info_dict(
-                with_handle=True,
-                with_url=not pool,
-                cluster_record=cluster_records[info.cluster_name],
-            ) for info in replica_infos
-        ]
+        # Latest launch-progress event of each replica that is still being
+        # provisioned, e.g. 'Launching (waiting for queue admission)' for a
+        # worker held by Kueue until quota frees up. Surfaced as the
+        # replica's status detail. One batched query for all replicas.
+        provisioning_hashes = set()
+        for info in replica_infos:
+            cluster_record = cluster_records[info.cluster_name]
+            if cluster_record is None:
+                continue
+            cluster_hash = cluster_record.get('cluster_hash')
+            if (cluster_hash is not None and
+                    info.status == serve_state.ReplicaStatus.PROVISIONING):
+                provisioning_hashes.add(cluster_hash)
+        launch_progress_by_hash = (
+            global_user_state.get_last_cluster_event_of_type_multiple(
+                provisioning_hashes,
+                global_user_state.ClusterEventType.LAUNCH_PROGRESS))
+        replica_info_dicts = []
+        for info in replica_infos:
+            cluster_record = cluster_records[info.cluster_name]
+            launch_progress = None
+            if cluster_record is not None:
+                launch_progress = launch_progress_by_hash.get(
+                    cluster_record.get('cluster_hash'))
+            replica_info_dicts.append(
+                info.to_info_dict(
+                    with_handle=True,
+                    with_url=not pool,
+                    cluster_record=cluster_record,
+                    launch_progress=launch_progress,
+                ))
+        record['replica_info'] = replica_info_dicts
         if pool:
             # Fetch all nonterminal job ids in the pool in a single query,
             # grouped by current_cluster_name. Avoids the N+1 pattern of
@@ -955,6 +1002,25 @@ def _get_service_status(
     return record
 
 
+def _bare_service_status(service_name: str,
+                         pool: bool) -> Optional[Dict[str, Any]]:
+    """The service's database record alone, for a service whose full status
+    cannot be built: no replicas, no autoscaler info and no pool YAML. The
+    task YAML stays, since `update` reads the service's config from it."""
+    try:
+        record = serve_state.get_service_from_name(service_name)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.error(f'Failed to read the record of {service_name}: '
+                     f'{common_utils.format_exception(e)}')
+        return None
+    if record is None or record['pool'] != pool:
+        return None
+    record['pool_yaml'] = ''
+    record['target_num_replicas'] = None
+    record['replica_info'] = []
+    return record
+
+
 def get_service_status_pickled(service_names: Optional[List[str]],
                                pool: bool) -> List[Dict[str, str]]:
     if service_names is None:
@@ -974,7 +1040,17 @@ def get_service_status_pickled(service_names: Optional[List[str]],
     parent_ctx = contextvars.copy_context()
 
     def _run_in_context(name: str) -> Optional[Dict[str, Any]]:
-        return parent_ctx.copy().run(_get_service_status, name, pool=pool)
+        try:
+            return parent_ctx.copy().run(_get_service_status, name, pool=pool)
+        except Exception as e:  # pylint: disable=broad-except
+            # One service whose status cannot be built (a dead controller, a
+            # replica whose cluster record is gone) must not hide the
+            # others: down, logs and terminate-replica look every service up
+            # to check its creator, and `--purge` exists for this service.
+            logger.error(f'Failed to get the status of {name}: '
+                         f'{common_utils.format_exception(e)}\n'
+                         f'Traceback: {traceback.format_exc()}')
+            return _bare_service_status(name, pool)
 
     max_workers = min(len(service_names), _STATUS_FANOUT_MAX_WORKERS)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -1153,14 +1229,22 @@ def get_next_cluster_name(
 
     Returns:
         The cluster name if a suitable replica is found, None otherwise.
+
+    Raises:
+        exceptions.PoolDoesNotExistError: If the pool does not exist (e.g. it
+            was deleted while a job bound to it was still running). This is
+            unrecoverable for the calling job, unlike the None return which
+            means no worker is currently free.
     """
     # Check if service exists
     service_status = _get_service_status(service_name,
                                          pool=True,
                                          with_replica_info=False)
     if service_status is None:
-        logger.error(f'Service {service_name!r} does not exist.')
-        return None
+        logger.error(f'Pool {service_name!r} does not exist.')
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.PoolDoesNotExistError(
+                f'Pool {service_name!r} does not exist.')
     if not service_status['pool']:
         logger.error(f'Service {service_name!r} is not a pool.')
         return None
@@ -2009,6 +2093,12 @@ def _format_replica_table(replica_records: List[Dict[str, Any]], show_all: bool,
         resources_str = '-'
         replica_status = record['status']
         status_str = replica_status.colored_str()
+        # Why the replica is still PROVISIONING, when the provisioner
+        # reported it (e.g. waiting for queue admission). Only sent by
+        # newer servers.
+        status_detail = record.get('status_detail')
+        if status_detail:
+            status_str += f' ({status_detail})'
         used_by = record.get('used_by', None)
         if used_by is None:
             used_by_str = '-'
@@ -2150,7 +2240,18 @@ class ServeCodeGen:
             f'{service_name!r}, {job_id}, **kwargs)',
             'print(msg, end="", flush=True)'
         ]
-        return cls._build(code)
+        cmd = cls._build(code)
+        # When running in consolidation mode, the codegen subprocess inherits
+        # SKYPILOT_GLOBAL_CONFIG pointing to the client override config, which
+        # lacks serve.controller.consolidation_mode=true. The subprocess would
+        # then read the server config from the client override path and
+        # incorrectly conclude it is NOT in consolidation mode, causing a
+        # 300-second CONTROLLER_SETUP_TIMEOUT. Bake OVERRIDE_CONSOLIDATION_MODE
+        # into the shell command so the subprocess always sees the correct mode.
+        if is_consolidation_mode(pool):
+            cmd = (f'export {skylet_constants.OVERRIDE_CONSOLIDATION_MODE}'
+                   f'=true; {cmd}')
+        return cmd
 
     @classmethod
     def stream_replica_logs(cls, service_name: str, replica_id: int,

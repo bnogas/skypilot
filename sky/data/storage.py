@@ -1,15 +1,18 @@
 """Storage and Store Classes for Sky Data."""
 from abc import abstractmethod
+import concurrent.futures
 import dataclasses
 import enum
 import hashlib
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import tempfile
 import time
 import typing
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 import urllib.parse
 
 import colorama
@@ -25,9 +28,11 @@ from sky.adaptors import azure
 from sky.adaptors import cloudflare
 from sky.adaptors import coreweave
 from sky.adaptors import gcp
+from sky.adaptors import huggingface
 from sky.adaptors import ibm
 from sky.adaptors import nebius
 from sky.adaptors import oci
+from sky.adaptors import oci_s3
 from sky.adaptors import vastdata
 from sky.clouds import cloud as sky_cloud
 from sky.data import data_transfer
@@ -46,6 +51,77 @@ if typing.TYPE_CHECKING:
     import mypy_boto3_s3
 
 logger = sky_logging.init_logger(__name__)
+
+
+def _get_accessible_handle(
+        storage_name: Optional[str],
+        for_controller: bool = False) -> Optional['Storage.StorageMetadata']:
+    """The handle of a sky-managed storage the caller may reuse by name.
+
+    Reuse by name syncs into the bucket and, with ``persistent: false``,
+    deletes it, so it needs write access to the storage's workspace, as
+    deletion does. Outside a request the code runs on a controller, pinned
+    to the workspace of its job or service (in consolidation mode too), and
+    reaches that workspace's storage only. ``for_controller`` holds a
+    request to that rule as well, for a storage the controller will tear
+    down: accepting it here would leave its bucket behind.
+
+    Raises:
+        exceptions.StorageWorkspaceError: If the storage is in a workspace
+            the caller cannot read, or the controller does not run for, or
+            (``for_controller``) that is not the active one.
+        exceptions.StorageReadOnlyError: If the storage is in a workspace
+            the caller can only read.
+    """
+    if storage_name is None:
+        return None
+    record = global_user_state.get_storage_by_name(storage_name)
+    if record is None:
+        return None
+    workspace = record['workspace']
+    active = skypilot_config.get_active_workspace()
+    if not common_utils.is_in_request_context():
+        if workspace == active:
+            return record['handle']
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.StorageWorkspaceError(
+                f'Storage {storage_name!r} not found in workspace '
+                f'{skypilot_config.get_workspace_name(active)!r}.')
+    # Imported here because of a circular import: sky.server.common imports
+    # sky.data (this module), and sky.workspaces.core reaches back to
+    # sky.server.common through sky.backends.backend_utils -> sky.jobs ->
+    # sky.client.common -> sky.schemas.api.responses.
+    # pylint: disable=import-outside-toplevel
+    from sky.workspaces import core as workspaces_core
+    readable, writable = workspaces_core.get_workspace_access_sets()
+    if workspace in writable:
+        if for_controller and workspace != active:
+            workspace_name = skypilot_config.get_workspace_name(workspace)
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageWorkspaceError(
+                    f'Storage {storage_name!r} is in workspace '
+                    f'{workspace_name!r}, not in the active workspace '
+                    f'{skypilot_config.get_workspace_name(active)!r}. A job '
+                    'or service tears its storage down from the workspace '
+                    'it is launched in, so launch it in workspace '
+                    f'{workspace_name!r} to use this storage.')
+        return record['handle']
+    if workspace in readable:
+        with ux_utils.print_exception_no_traceback():
+            raise exceptions.StorageReadOnlyError(
+                f'Storage {storage_name!r} is in workspace '
+                f'{skypilot_config.get_workspace_name(workspace)!r}, which '
+                'is read-only for you.')
+    if (not for_controller and
+            workspaces_core.get_readable_workspace_names() is None):
+        # An admin, and the workspace was removed from the config: the
+        # access sets cover configured workspaces only.
+        return record['handle']
+    with ux_utils.print_exception_no_traceback():
+        raise exceptions.StorageWorkspaceError(
+            f'Storage name {storage_name!r} is taken by a storage in a '
+            'workspace you cannot access. Choose another name.')
+
 
 StorageHandle = Any
 StorageStatus = status_lib.StorageStatus
@@ -66,6 +142,7 @@ STORE_ENABLED_CLOUDS: List[str] = [
     cloudflare.NAME,
     coreweave.NAME,
     vastdata.NAME,
+    huggingface.NAME,
 ]
 
 # Maximum number of concurrent rsync upload processes
@@ -107,6 +184,10 @@ def get_cached_enabled_storage_cloud_names_or_refresh(
     if vastdata_is_enabled:
         enabled_clouds.append(vastdata.NAME)
 
+    hf_is_enabled, _ = huggingface.check_storage_credentials()
+    if hf_is_enabled:
+        enabled_clouds.append(huggingface.NAME)
+
     if raise_if_no_cloud_access and not enabled_clouds:
         raise exceptions.NoCloudAccessError(
             'No cloud access available for storage. '
@@ -142,6 +223,7 @@ class StoreType(enum.Enum):
     NEBIUS = 'NEBIUS'
     COREWEAVE = 'COREWEAVE'
     VASTDATA = 'VASTDATA'
+    HF = 'HF'
     VOLUME = 'VOLUME'
 
     @classmethod
@@ -184,6 +266,8 @@ class StoreType(enum.Enum):
             return StoreType.AZURE
         elif cloud_lower == str(clouds.OCI()).lower():
             return StoreType.OCI
+        elif cloud_lower == huggingface.NAME.lower():
+            return StoreType.HF
         elif cloud_lower == str(clouds.Lambda()).lower():
             with ux_utils.print_exception_no_traceback():
                 raise ValueError('Lambda Cloud does not provide cloud storage.')
@@ -210,6 +294,8 @@ class StoreType(enum.Enum):
             return str(clouds.IBM())
         elif self == StoreType.OCI:
             return str(clouds.OCI())
+        elif self == StoreType.HF:
+            return huggingface.NAME
         else:
             raise ValueError(f'Unknown store type: {self}')
 
@@ -226,6 +312,8 @@ class StoreType(enum.Enum):
             return StoreType.IBM
         elif isinstance(store, OciStore):
             return StoreType.OCI
+        elif isinstance(store, HuggingFaceStore):
+            return StoreType.HF
         else:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(f'Unknown store type: {store}')
@@ -243,6 +331,8 @@ class StoreType(enum.Enum):
             return 'cos://'
         elif self == StoreType.OCI:
             return 'oci://'
+        elif self == StoreType.HF:
+            return huggingface.HF_BUCKETS_URL_PREFIX
         else:
             with ux_utils.print_exception_no_traceback():
                 raise ValueError(f'Unknown store type: {self}')
@@ -284,6 +374,8 @@ class StoreType(enum.Enum):
         storage_account_name = None
         region = None
         for store_type in StoreType:
+            if store_type == StoreType.VOLUME:
+                continue
             if store_url.startswith(store_type.store_prefix()):
                 if store_type == StoreType.AZURE:
                     storage_account_name, bucket_name, sub_path = \
@@ -293,6 +385,8 @@ class StoreType(enum.Enum):
                         store_url)
                 elif store_type == StoreType.GCS:
                     bucket_name, sub_path = data_utils.split_gcs_path(store_url)
+                elif store_type == StoreType.HF:
+                    bucket_name, sub_path = data_utils.split_hf_path(store_url)
                 else:
                     # Check compatible stores
                     for compatible_store_type, store_class in \
@@ -496,6 +590,10 @@ class MountConfig:
     """
     # Mount as read-only.
     read_only: Optional[bool] = None
+    # Extra CLI flags forwarded verbatim to ``hf-mount`` (Hugging Face stores
+    # only; ignored by every other store). Each element is one shell token,
+    # e.g. ``['--cache-dir', '/mnt/nvme/hf-cache', '--advanced-writes']``.
+    hf_mount_args: Optional[List[str]] = None
 
     def to_yaml_config(self) -> Dict[str, Any]:
         """Serialize non-None fields to a dict for YAML round-tripping."""
@@ -733,7 +831,7 @@ class AbstractStore:
         if self.source is None:
             # Retrieve a handle associated with the storage name.
             # This handle links to sky managed storage if it exists.
-            handle = global_user_state.get_handle_from_storage_name(self.name)
+            handle = _get_accessible_handle(self.name)
             # If handle is None, it implies the bucket is created
             # externally and not managed by Skypilot. For mounting such
             # externally created buckets, users must provide the
@@ -941,6 +1039,12 @@ class Storage(object):
         self._bucket_sub_path = _bucket_sub_path
 
         self._constructed = False
+        # Whether the record under this name was loaded into this object, by
+        # ``construct`` or ``from_handle``; until then the record is not its.
+        self._record_loaded = False
+        # Store types of the loaded record whose buckets were deleted outside
+        # SkyPilot (not ones whose lookup failed for another reason).
+        self._gone_store_types: Set[StoreType] = set()
         # TODO(romilb, zhwu): This is a workaround to support storage deletion
         # for managed jobs. Once sky storage supports forced management for
         # external buckets, this can be deprecated.
@@ -970,6 +1074,19 @@ class Storage(object):
                     'config.mount can only be specified when '
                     f'mode is {StorageMode.MOUNT.value}. '
                     f'Got mode={self.mode.value}.')
+        # _bucket_sub_path comes from the task YAML and ends up in shell
+        # commands that sync, mount and delete the bucket, so only allow a
+        # plain relative path. Stores strip leading/trailing slashes.
+        sub_path = (_bucket_sub_path.strip('/')
+                    if _bucket_sub_path is not None else '')
+        if sub_path and (not re.fullmatch(constants.SUB_PATH_PATTERN, sub_path)
+                         or '..' in sub_path.split('/')):
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageSpecError(
+                    f'Invalid _bucket_sub_path: {_bucket_sub_path!r}. Must be '
+                    'a relative path containing only alphanumeric characters, '
+                    'dots, slashes, underscores and hyphens, and must not '
+                    'contain directory traversal (..).')
 
     def resolve_mount_cached_config(self) -> Optional[MountCachedConfig]:
         """Resolve file_mount_type + overrides into a final MountCachedConfig.
@@ -984,6 +1101,21 @@ class Storage(object):
             return merge_mount_cached_config(self.file_mount_type,
                                              self.mount_cached_config)
         return self.mount_cached_config
+
+    def check_accessible(self) -> None:
+        """Refuses a storage the caller may not reuse by name, before the
+        task reaches a controller. A controller constructs outside any
+        request what it tears down, the non-persistent mounts, and only in
+        its own workspace, so those are held to the active workspace here;
+        a persistent mount is constructed through a request as the owner.
+        The name of a storage given by a bucket URL is the bucket's, as
+        ``construct`` will set it. A name no storage has yet passes.
+        """
+        name = self.name
+        if (name is None and isinstance(self.source, str) and
+                data_utils.is_cloud_store_url(self.source)):
+            name, _ = self._name_from_source(self.source)
+        _get_accessible_handle(name, for_controller=not self.persistent)
 
     def construct(self):
         """Constructs the storage object.
@@ -1009,9 +1141,10 @@ class Storage(object):
         self._validate_storage_spec(self.name)
 
         # Logic to rebuild Storage if it is in global user state
-        handle = global_user_state.get_handle_from_storage_name(self.name)
+        handle = _get_accessible_handle(self.name)
         if handle is not None:
             self.handle = handle
+            self._record_loaded = True
             # Reconstruct the Storage object from the global_user_state
             logger.debug('Detected existing storage object, '
                          f'loading Storage: {self.name}')
@@ -1088,6 +1221,8 @@ class Storage(object):
                         self.add_store(StoreType.IBM)
                     elif self.source.startswith('oci://'):
                         self.add_store(StoreType.OCI)
+                    elif data_utils.is_hf_path(self.source):
+                        self.add_store(StoreType.HF)
 
                     s3_compatible_store_type: Optional[StoreType] = (
                         StoreType.find_s3_compatible_config_by_prefix(
@@ -1182,12 +1317,15 @@ class Storage(object):
                 is_local_source = True
             elif split_path.scheme in [
                     's3', 'gs', 'https', 'r2', 'cos', 'oci', 'nebius', 'cw',
-                    'vastdata'
+                    'vastdata', 'hf'
             ]:
                 is_local_source = False
                 # Storage mounting does not support mounting specific files from
-                # cloud store - ensure path points to only a directory
-                if mode in MOUNTABLE_STORAGE_MODES:
+                # cloud store - ensure path points to only a directory.
+                # ``hf://`` is exempt because hf-mount supports mounting
+                # sub-paths within a bucket or repo.
+                if (mode in MOUNTABLE_STORAGE_MODES and
+                        split_path.scheme != 'hf'):
                     if (split_path.scheme != 'https' and
                         ((split_path.scheme != 'cos' and
                           split_path.path.strip('/') != '') or
@@ -1208,7 +1346,7 @@ class Storage(object):
                     raise exceptions.StorageSourceError(
                         f'Supported paths: local, s3://, gs://, https://, '
                         f'r2://, cos://, oci://, nebius://, cw://, '
-                        f'vastdata://. Got: {source}')
+                        f'vastdata://, hf://. Got: {source}')
         return source, is_local_source
 
     def _validate_storage_spec(self, name: Optional[str]) -> None:
@@ -1233,6 +1371,7 @@ class Storage(object):
                     'nebius',
                     'cw',
                     'vastdata',
+                    'hf',
             ]:
                 with ux_utils.print_exception_no_traceback():
                     raise exceptions.StorageNameError(
@@ -1251,7 +1390,7 @@ class Storage(object):
                 # (e.g. used as scratch previously). Such storage objects can be
                 # mounted in copy mode even though they have no source in the
                 # yaml spec (the name is the source).
-                handle = global_user_state.get_handle_from_storage_name(name)
+                handle = _get_accessible_handle(name)
                 if handle is None:
                     with ux_utils.print_exception_no_traceback():
                         raise exceptions.StorageSourceError(
@@ -1281,13 +1420,9 @@ class Storage(object):
                 else:
                     assert isinstance(source, str)
                     # Set name to source bucket name and continue
-                    if source.startswith('cos://'):
-                        # cos url requires custom parsing
-                        name = data_utils.split_cos_path(source)[0]
-                    elif data_utils.is_az_container_endpoint(source):
-                        _, name, _ = data_utils.split_az_path(source)
-                    else:
-                        name = urllib.parse.urlsplit(source).netloc
+                    name, sub_path = self._name_from_source(source)
+                    if sub_path and self._bucket_sub_path is None:
+                        self._bucket_sub_path = sub_path
                     assert name is not None, source
                     self.name = name
                     return
@@ -1308,6 +1443,28 @@ class Storage(object):
         raise exceptions.StorageSpecError(
             f'Validation failed for storage source {self.source}, name '
             f'{self.name} and mode {self.mode}. Please check the arguments.')
+
+    @staticmethod
+    def _name_from_source(source: str) -> Tuple[str, Optional[str]]:
+        """The bucket (or repo) a cloud store URL names, and the sub path
+        under it that an ``hf://`` URL may give."""
+        sub_path = None
+        if data_utils.is_hf_path(source):
+            if data_utils.is_hf_bucket_path(source):
+                name, sub_path = data_utils.split_hf_path(source)
+            else:
+                repo_type, repo_id, _, sub_path = (
+                    data_utils.split_hf_repo_path(source))
+                name = HuggingFaceStore.hf_id_from_repo_parts(
+                    repo_type, repo_id)
+        elif source.startswith('cos://'):
+            # cos url requires custom parsing
+            name = data_utils.split_cos_path(source)[0]
+        elif data_utils.is_az_container_endpoint(source):
+            _, name, _ = data_utils.split_az_path(source)
+        else:
+            name = urllib.parse.urlsplit(source).netloc
+        return name, sub_path
 
     def _add_store_from_metadata(
             self, sky_stores: Dict[StoreType,
@@ -1361,7 +1518,16 @@ class Storage(object):
                         sync_on_reconstruction=self.sync_on_reconstruction,
                         _bucket_sub_path=self._bucket_sub_path)
                 elif s_type == StoreType.OCI:
-                    store = OciStore.from_metadata(
+                    oci_store_cls: Type[AbstractStore] = (
+                        OciS3CompatibleStore
+                        if oci_s3.use_s3_api() else OciStore)
+                    store = oci_store_cls.from_metadata(
+                        s_metadata,
+                        source=self.source,
+                        sync_on_reconstruction=self.sync_on_reconstruction,
+                        _bucket_sub_path=self._bucket_sub_path)
+                elif s_type == StoreType.HF:
+                    store = HuggingFaceStore.from_metadata(
                         s_metadata,
                         source=self.source,
                         sync_on_reconstruction=self.sync_on_reconstruction,
@@ -1396,6 +1562,7 @@ class Storage(object):
                     logger.debug(f'Storage object {self.name!r} was attempted '
                                  'to be reconstructed while the corresponding '
                                  'bucket was externally deleted.')
+                self._gone_store_types.add(s_type)
                 continue
             self._add_store(store, is_reconstructed=True)
 
@@ -1477,7 +1644,10 @@ class Storage(object):
         elif store_type == StoreType.IBM:
             store_cls = IBMCosStore
         elif store_type == StoreType.OCI:
-            store_cls = OciStore
+            store_cls = (OciS3CompatibleStore
+                         if oci_s3.use_s3_api() else OciStore)
+        elif store_type == StoreType.HF:
+            store_cls = HuggingFaceStore
         else:
             with ux_utils.print_exception_no_traceback():
                 raise exceptions.StorageSpecError(
@@ -1545,10 +1715,31 @@ class Storage(object):
             store_type: StoreType; Specific cloud store to remove from the list
               of backing stores.
         """
+        unbuilt = [t for t, s in self.stores.items() if s is None]
+        if any(t not in self._gone_store_types for t in unbuilt):
+            # A store type booked but never built: construction was refused,
+            # did not finish, or could not look the bucket up (e.g. a 403).
+            # The bucket may still exist; leave it and its record.
+            logger.warning('Could not look up or construct storage '
+                           f'{self.name!r}; leaving its bucket and record.')
+            return
+        # The rest are in the loaded record but their buckets are gone
+        # (deleted outside SkyPilot): nothing left to delete for them. Only
+        # a rebuild without sync_on_reconstruction (`sky storage delete`)
+        # gets here; a task's teardown re-creates the bucket first.
+        for t in unbuilt:
+            del self.stores[t]
         if not self.stores:
+            if not self._record_loaded:
+                # A record under this name, if any, belongs to a storage this
+                # object was refused, or never reached. Leave it.
+                logger.debug(f'Storage {self.name!r} has no stores of its '
+                             'own; nothing to delete.')
+                return
             logger.info('No backing stores found. Deleting storage.')
             assert self.name is not None
             global_user_state.remove_storage(self.name)
+            return
         if store_type is not None:
             assert self.name is not None
             store = self.stores[store_type]
@@ -1632,6 +1823,7 @@ class Storage(object):
                   source=handle.source,
                   sync_on_reconstruction=False)
         obj.handle = handle
+        obj._record_loaded = True
         obj._add_store_from_metadata(handle.sky_stores)
         return obj
 
@@ -1781,6 +1973,9 @@ class S3CompatibleConfig:
     credentials_file: Optional[str] = None
     config_file: Optional[str] = None
     extra_cli_args: Optional[List[str]] = None
+    # Extra environment variables to prefix onto the AWS CLI upload commands.
+    # Used by OCI to disable aws-chunked uploads (see OciS3CompatibleStore).
+    extra_cli_env: Optional[Dict[str, str]] = None
 
     # Provider-specific settings
     cloud_name: str = ''
@@ -1794,6 +1989,8 @@ class S3CompatibleConfig:
     def __post_init__(self):
         if self.extra_cli_args is None:
             self.extra_cli_args = []
+        if self.extra_cli_env is None:
+            self.extra_cli_env = {}
 
 
 class S3CompatibleStore(AbstractStore):
@@ -2215,7 +2412,7 @@ class S3CompatibleStore(AbstractStore):
             # Build AWS CLI command with provider-specific configuration
             cmd_parts = ['aws s3 sync --no-follow-symlinks --exclude="*"']
             cmd_parts.append(f'{includes} {base_dir_path}')
-            cmd_parts.append(f's3://{self.name}{sub_path}')
+            cmd_parts.append(shlex.quote(f's3://{self.name}{sub_path}'))
 
             # Add provider-specific arguments
             if self.config.get_endpoint_url:
@@ -2234,6 +2431,8 @@ class S3CompatibleStore(AbstractStore):
             if self.config.config_file:
                 cmd = 'AWS_CONFIG_FILE=' + \
                 f'{self.config.config_file} {cmd}'
+            for env_key, env_val in (self.config.extra_cli_env or {}).items():
+                cmd = f'{env_key}={env_val} {cmd}'
 
             return cmd
 
@@ -2265,7 +2464,8 @@ class S3CompatibleStore(AbstractStore):
 
             cmd_parts = ['aws s3 sync --no-follow-symlinks']
             cmd_parts.append(f'{excludes} {src_dir_path}')
-            cmd_parts.append(f's3://{self.name}{sub_path}/{dest_dir_name}')
+            cmd_parts.append(
+                shlex.quote(f's3://{self.name}{sub_path}/{dest_dir_name}'))
 
             if self.config.get_endpoint_url:
                 cmd_parts.append(
@@ -2282,6 +2482,8 @@ class S3CompatibleStore(AbstractStore):
             if self.config.config_file:
                 cmd = 'AWS_CONFIG_FILE=' + \
                 f'{self.config.config_file} {cmd}'
+            for env_key, env_val in (self.config.extra_cli_env or {}).items():
+                cmd = f'{env_key}={env_val} {cmd}'
 
             return cmd
 
@@ -2457,7 +2659,8 @@ class S3CompatibleStore(AbstractStore):
 
     def _delete_bucket_sub_path(self, bucket_name: str, sub_path: str) -> bool:
         """Delete objects in the sub path from the bucket."""
-        cmd_parts = [f'aws s3 rm s3://{bucket_name}/{sub_path}/ --recursive']
+        sub_path_url = shlex.quote(f's3://{bucket_name}/{sub_path}/')
+        cmd_parts = [f'aws s3 rm {sub_path_url} --recursive']
 
         if self.config.aws_profile:
             cmd_parts.append(f'--profile={self.config.aws_profile}')
@@ -2733,8 +2936,11 @@ class GcsStore(AbstractStore):
         gsutil_alias, alias_gen = data_utils.get_gsutil_command()
         sub_path = (f'/{self._bucket_sub_path}'
                     if self._bucket_sub_path else '')
-        sync_command = (f'{alias_gen}; echo "{copy_list}" | {gsutil_alias} '
-                        f'cp -e -n -r -I gs://{self.name}{sub_path}')
+        dest_url = shlex.quote(f'gs://{self.name}{sub_path}')
+        # copy_list holds client-controlled paths, so it is quoted as a single
+        # shell argument (the quoting keeps the embedded newlines).
+        sync_command = (f'{alias_gen}; echo {shlex.quote(copy_list)} | '
+                        f'{gsutil_alias} cp -e -n -r -I {dest_url}')
         log_path = sky_logging.generate_tmp_logging_file_path(
             _STORAGE_LOG_FILE_NAME)
         sync_path = f'{source_message} -> gs://{self.name}{sub_path}/'
@@ -2773,24 +2979,34 @@ class GcsStore(AbstractStore):
                     if self._bucket_sub_path else '')
 
         def get_file_sync_command(base_dir_path, file_names):
+            # file_names are client-controlled (they are the names of the
+            # uploaded files), so the regex is built first and then quoted as a
+            # single shell argument.
             sync_format = '|'.join(file_names)
+            exclude_pattern = shlex.quote(f'^(?!{sync_format}$).*')
             gsutil_alias, alias_gen = data_utils.get_gsutil_command()
             base_dir_path = shlex.quote(base_dir_path)
+            dest_url = shlex.quote(f'gs://{self.name}{sub_path}')
             sync_command = (f'{alias_gen}; {gsutil_alias} '
-                            f'rsync -e -x \'^(?!{sync_format}$).*\' '
-                            f'{base_dir_path} gs://{self.name}{sub_path}')
+                            f'rsync -e -x {exclude_pattern} '
+                            f'{base_dir_path} {dest_url}')
             return sync_command
 
         def get_dir_sync_command(src_dir_path, dest_dir_name):
             excluded_list = storage_utils.get_excluded_files(src_dir_path)
             # we exclude .git directory from the sync
             excluded_list.append(r'^\.git/.*$')
+            # excluded_list is derived from client-controlled file names, so the
+            # regex is built first and then quoted as a single shell argument.
             excludes = '|'.join(excluded_list)
+            exclude_pattern = shlex.quote(f'({excludes})')
             gsutil_alias, alias_gen = data_utils.get_gsutil_command()
             src_dir_path = shlex.quote(src_dir_path)
+            dest_url = shlex.quote(
+                f'gs://{self.name}{sub_path}/{dest_dir_name}')
             sync_command = (f'{alias_gen}; {gsutil_alias} '
-                            f'rsync -e -r -x \'({excludes})\' {src_dir_path} '
-                            f'gs://{self.name}{sub_path}/{dest_dir_name}')
+                            f'rsync -e -r -x {exclude_pattern} {src_dir_path} '
+                            f'{dest_url}')
             return sync_command
 
         # Generate message for upload
@@ -3001,9 +3217,9 @@ class GcsStore(AbstractStore):
                 return False
             try:
                 gsutil_alias, alias_gen = data_utils.get_gsutil_command()
-                remove_obj_command = (
-                    f'{alias_gen};{gsutil_alias} '
-                    f'rm -r gs://{bucket_name}{command_suffix}')
+                remove_url = shlex.quote(f'gs://{bucket_name}{command_suffix}')
+                remove_obj_command = (f'{alias_gen};{gsutil_alias} '
+                                      f'rm -r {remove_url}')
                 subprocess.check_output(remove_obj_command,
                                         stderr=subprocess.STDOUT,
                                         shell=True,
@@ -3303,10 +3519,12 @@ class AzureBlobStore(AbstractStore):
         """
         assert region is not None
         subscription_id = azure.get_subscription_id()
-        subscription_hash_obj = hashlib.md5(subscription_id.encode('utf-8'))
+        subscription_hash_obj = hashlib.md5(subscription_id.encode('utf-8'),
+                                            usedforsecurity=False)
         subscription_hash = subscription_hash_obj.hexdigest(
         )[:AzureBlobStore._SUBSCRIPTION_HASH_LENGTH]
-        region_hash_obj = hashlib.md5(region.encode('utf-8'))
+        region_hash_obj = hashlib.md5(region.encode('utf-8'),
+                                      usedforsecurity=False)
         region_hash = region_hash_obj.hexdigest()[:AzureBlobStore.
                                                   _REGION_HASH_LENGTH]
 
@@ -3621,11 +3839,12 @@ class AzureBlobStore(AbstractStore):
                           if self._bucket_sub_path else self.container_name)
 
         def get_file_sync_command(base_dir_path, file_names) -> str:
-            # shlex.quote is not used for file_names as 'az storage blob sync'
-            # already handles file names with empty spaces when used with
-            # '--include-pattern' option.
+            # file_names are client-controlled, so the ';'-joined pattern is
+            # built first and then quoted as a single shell argument. 'az
+            # storage blob sync' still receives the literal pattern (including
+            # any spaces) via '--include-pattern'.
             includes_list = ';'.join(file_names)
-            includes = f'--include-pattern "{includes_list}"'
+            includes = f'--include-pattern {shlex.quote(includes_list)}'
             base_dir_path = shlex.quote(base_dir_path)
             sync_command = (f'az storage blob sync '
                             f'--account-name {self.storage_account_name} '
@@ -3633,28 +3852,32 @@ class AzureBlobStore(AbstractStore):
                             f'{includes} '
                             '--delete-destination false '
                             f'--source {base_dir_path} '
-                            f'--container {container_path}')
+                            f'--container {shlex.quote(container_path)}')
             return sync_command
 
         def get_dir_sync_command(src_dir_path, dest_dir_name) -> str:
             # we exclude .git directory from the sync
             excluded_list = storage_utils.get_excluded_files(src_dir_path)
             excluded_list.append('.git/')
+            # excluded_list is derived from client-controlled file names, so the
+            # ';'-joined pattern is built first and then quoted as a single
+            # shell argument.
             excludes_list = ';'.join(
                 [file_name.rstrip('*') for file_name in excluded_list])
-            excludes = f'--exclude-path "{excludes_list}"'
+            excludes = f'--exclude-path {shlex.quote(excludes_list)}'
             src_dir_path = shlex.quote(src_dir_path)
             if dest_dir_name:
                 dest_dir_name = f'/{dest_dir_name}'
             else:
                 dest_dir_name = ''
+            dest_container = shlex.quote(f'{container_path}{dest_dir_name}')
             sync_command = (f'az storage blob sync '
                             f'--account-name {self.storage_account_name} '
                             f'--account-key {self.storage_account_key} '
                             f'{excludes} '
                             '--delete-destination false '
                             f'--source {src_dir_path} '
-                            f'--container {container_path}{dest_dir_name}')
+                            f'--container {dest_container}')
             return sync_command
 
         # Generate message for upload
@@ -4147,10 +4370,10 @@ class IBMCosStore(AbstractStore):
             # .git directory is excluded from the sync
             # wrapping src_dir_path with "" to support path with spaces
             src_dir_path = shlex.quote(src_dir_path)
+            dest_path = shlex.quote(f'{self.rclone_profile_name}:{self.name}'
+                                    f'{sub_path}/{dest_dir_name}')
             sync_command = ('rclone copy --exclude ".git/*" '
-                            f'{src_dir_path} '
-                            f'{self.rclone_profile_name}:{self.name}{sub_path}'
-                            f'/{dest_dir_name}')
+                            f'{src_dir_path} {dest_path}')
             return sync_command
 
         def get_file_sync_command(base_dir_path, file_names) -> str:
@@ -4176,9 +4399,10 @@ class IBMCosStore(AbstractStore):
                 for file_name in file_names
             ])
             base_dir_path = shlex.quote(base_dir_path)
+            dest_path = shlex.quote(
+                f'{self.rclone_profile_name}:{self.name}{sub_path}')
             sync_command = ('rclone copy '
-                            f'{includes} {base_dir_path} '
-                            f'{self.rclone_profile_name}:{self.name}{sub_path}')
+                            f'{includes} {base_dir_path} {dest_path}')
             return sync_command
 
         # Generate message for upload
@@ -4598,15 +4822,21 @@ class OciStore(AbstractStore):
 
         @oci.with_oci_env
         def get_file_sync_command(base_dir_path, file_names):
-            includes = ' '.join(
-                [f'--include "{file_name}"' for file_name in file_names])
+            # file_names are client-controlled, so each is quoted as a single
+            # shell argument.
+            includes = ' '.join([
+                f'--include {shlex.quote(file_name)}'
+                for file_name in file_names
+            ])
             prefix_arg = ''
             if sub_path:
-                prefix_arg = f'--object-prefix "{sub_path.strip("/")}"'
+                prefix_arg = ('--object-prefix '
+                              f'{shlex.quote(sub_path.strip("/"))}')
             sync_command = (
                 'oci os object bulk-upload --no-follow-symlinks --overwrite '
                 f'--bucket-name {self.name} --namespace-name {self.namespace} '
-                f'--region {self.region} --src-dir "{base_dir_path}" '
+                f'--region {self.region} '
+                f'--src-dir {shlex.quote(base_dir_path)} '
                 f'{prefix_arg} '
                 f'{includes}')
 
@@ -4624,13 +4854,14 @@ class OciStore(AbstractStore):
                 for file_name in excluded_list
             ])
 
+            object_prefix = shlex.quote(f'{sub_path}{dest_dir_name}')
             # we exclude .git directory from the sync
             sync_command = (
                 'oci os object bulk-upload --no-follow-symlinks --overwrite '
                 f'--bucket-name {self.name} --namespace-name {self.namespace} '
                 f'--region {self.region} '
-                f'--object-prefix "{sub_path}{dest_dir_name}" '
-                f'--src-dir "{src_dir_path}" {excludes}')
+                f'--object-prefix {object_prefix} '
+                f'--src-dir {shlex.quote(src_dir_path)} {excludes}')
 
             return sync_command
 
@@ -5202,3 +5433,716 @@ class VastDataStore(S3CompatibleStore):
             config)
         return mounting_utils.get_mounting_command(mount_path, install_cmd,
                                                    mount_cached_cmd)
+
+
+class OciS3CompatibleStore(S3CompatibleStore):
+    """OciS3CompatibleStore represents the backend for OCI buckets accessed
+    via OCI Object Storage's Amazon S3 Compatibility API.
+
+    https://docs.oracle.com/en-us/iaas/Content/Object/Tasks/s3compatibleapi.htm
+
+    It shares StoreType.OCI and the oci:// prefix with the native OciStore;
+    which class serves a request is decided at the StoreType.OCI dispatch
+    sites based on oci_s3.use_s3_api(). It must therefore not be decorated
+    with @register_s3_compatible_store: the registry is consulted before
+    the StoreType.OCI dispatch branches, and registering under 'OCI' would
+    take over all OCI dispatch unconditionally.
+    """
+
+    def __init__(self,
+                 name: str,
+                 source: str,
+                 region: Optional[str] = None,
+                 is_sky_managed: Optional[bool] = None,
+                 sync_on_reconstruction: bool = True,
+                 _bucket_sub_path: Optional[str] = None):
+        # The native OciStore supports a <bucket>@<region> suffix. The
+        # S3-compatible endpoint is pinned to a single region, so a region
+        # suffix cannot be honored here. Only reject @ in source when it is
+        # an oci:// URI; a local path containing @ is valid.
+        for bucket_expr in (name, source):
+            if not isinstance(bucket_expr, str):
+                continue
+            is_oci_uri = bucket_expr.startswith('oci://')
+            if is_oci_uri:
+                bucket_expr = data_utils.split_oci_path(bucket_expr)[0]
+            if (bucket_expr == name or is_oci_uri) and '@' in bucket_expr:
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.StorageNameError(
+                        f'<bucket>@<region> ({bucket_expr!r}) is not '
+                        'supported when accessing OCI via the S3-compatible '
+                        'API; the region is determined by the endpoint in '
+                        f'{oci_s3.OCI_S3_CONFIG_PATH}.')
+        super().__init__(name, source, region, is_sky_managed,
+                         sync_on_reconstruction, _bucket_sub_path)
+
+    @classmethod
+    def get_config(cls) -> S3CompatibleConfig:
+        """Return the configuration for the OCI S3-compatible API."""
+        return S3CompatibleConfig(
+            store_type='OCI',
+            url_prefix='oci://',
+            client_factory=lambda region: data_utils.create_oci_s3_client(),
+            resource_factory=lambda name: oci_s3.resource('s3').Bucket(name),
+            split_path=data_utils.split_oci_path,
+            verify_bucket=data_utils.verify_oci_s3_bucket,
+            aws_profile=oci_s3.OCI_S3_PROFILE_NAME,
+            get_endpoint_url=oci_s3.get_endpoint,
+            credentials_file=oci_s3.OCI_S3_CREDENTIALS_PATH,
+            config_file=oci_s3.OCI_S3_CONFIG_PATH,
+            # OCI returns 501 for aws-chunked uploads, which the AWS CLI
+            # enables by default to carry a trailing checksum. Disable it so
+            # `aws s3 sync` uploads are sent as plain (non-chunked) requests.
+            # Response validation is relaxed to match.
+            extra_cli_env={
+                'AWS_REQUEST_CHECKSUM_CALCULATION': 'when_required',
+                'AWS_RESPONSE_CHECKSUM_VALIDATION': 'when_required',
+            },
+            cloud_name=str(clouds.OCI()),
+            default_region=oci_s3.get_region(),
+            mount_cmd_factory=cls._get_oci_s3_mount_cmd,
+        )
+
+    @classmethod
+    def validate_name(cls, name: str) -> str:
+        """Validates the store name using OCI bucket naming rules.
+
+        OCI bucket names allow uppercase letters and underscores, which the
+        generic S3 rules would reject; buckets created via the native API
+        must remain accessible via the S3-compatible API.
+        """
+        return OciStore.validate_name(name)
+
+    @classmethod
+    def _get_oci_s3_mount_cmd(cls,
+                              bucket_name: str,
+                              mount_path: str,
+                              bucket_sub_path: Optional[str],
+                              read_only: bool = False) -> str:
+        """Factory method for the OCI S3-compatible mount command."""
+        endpoint_url = oci_s3.get_endpoint()
+        return mounting_utils.get_oci_s3_mount_cmd(
+            oci_s3.OCI_S3_CREDENTIALS_PATH,
+            oci_s3.OCI_S3_PROFILE_NAME,
+            bucket_name,
+            endpoint_url,
+            mount_path,
+            region=oci_s3.get_region(),
+            _bucket_sub_path=bucket_sub_path,
+            read_only=read_only)
+
+    def mount_cached_command(self,
+                             mount_path: str,
+                             config: Optional[MountCachedConfig] = None) -> str:
+        """OCI S3-compatible cached mount implementation using rclone."""
+        install_cmd = mounting_utils.get_rclone_install_cmd()
+        rclone_profile_name = (
+            data_utils.Rclone.RcloneStores.OCI.get_profile_name(self.name))
+        rclone_config = data_utils.Rclone.RcloneStores.OCI.get_config(
+            rclone_profile_name=rclone_profile_name)
+        mount_cached_cmd = mounting_utils.get_mount_cached_cmd(
+            rclone_config, rclone_profile_name, self.bucket.name, mount_path,
+            config)
+        return mounting_utils.get_mounting_command(mount_path, install_cmd,
+                                                   mount_cached_cmd)
+
+
+class HuggingFaceStore(AbstractStore):
+    """HuggingFaceStore backs Storage objects with Hugging Face resources.
+
+    Supports two kinds of sources:
+
+    1. **Buckets** (read-write) -- Xet-backed S3-like object storage. Bucket
+       ids are ``<namespace>/<bucket-name>`` (e.g. ``my-user/my-bucket``).
+
+    2. **Repos** (read-only) -- models, datasets, and spaces. Source URLs:
+
+       - ``hf://<ns>/<model>[@<rev>][/<sub-path>]``
+       - ``hf://datasets/<ns>/<name>[@<rev>][/<sub-path>]``
+       - ``hf://spaces/<ns>/<name>[@<rev>][/<sub-path>]``
+
+       Repo mounts are always read-only; repo-typed stores are never
+       ``is_sky_managed``.
+
+    Bucket operations go through the ``huggingface_hub`` Python SDK; mounts
+    are performed with the ``hf-mount`` NFS backend.
+    """
+
+    _NAME_PATTERN = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._\-]{0,95}$')
+
+    # HF repo type values recognized by ``hf-mount`` and ``huggingface_hub``,
+    # mapped to the URL path segment that prefixes ``<ns>/<name>`` in an
+    # ``hf://`` URL and in the ``hf-mount`` CLI argument. Models have no
+    # prefix; datasets/spaces do.
+    _REPO_TYPE_TO_URL_PREFIX: Dict[str, str] = {
+        'model': '',
+        'dataset': 'datasets/',
+        'space': 'spaces/',
+    }
+
+    @classmethod
+    def hf_id_from_repo_parts(cls, repo_type: str, repo_id: str) -> str:
+        """Builds the ``hf-mount``-style id from a repo_type and repo_id.
+
+        Examples:
+            ``('model', 'openai/gpt2')`` -> ``'openai/gpt2'``
+            ``('dataset', 'ns/ds')``     -> ``'datasets/ns/ds'``
+            ``('space', 'ns/app')``      -> ``'spaces/ns/app'``
+        """
+        return f'{cls._REPO_TYPE_TO_URL_PREFIX.get(repo_type, "")}{repo_id}'
+
+    @classmethod
+    def strip_repo_type_prefix(cls, hf_id: str) -> str:
+        """Returns the bare ``ns/name`` from a prefixed id.
+
+        Inverse of :meth:`hf_id_from_repo_parts` for any recognized prefix;
+        returns ``hf_id`` unchanged for model ids (which have no prefix).
+        """
+        for prefix in cls._REPO_TYPE_TO_URL_PREFIX.values():
+            if prefix and hf_id.startswith(prefix):
+                return hf_id[len(prefix):]
+        return hf_id
+
+    def __init__(self,
+                 name: str,
+                 source: Optional[SourceType],
+                 region: Optional[str] = None,
+                 is_sky_managed: Optional[bool] = None,
+                 sync_on_reconstruction: Optional[bool] = True,
+                 _bucket_sub_path: Optional[str] = None):
+        # Classify bucket vs repo up front so we can dispatch in _validate /
+        # validate_name / initialize. ``_repo_type`` is None for buckets and
+        # one of the keys of ``_REPO_TYPE_TO_URL_PREFIX`` for repos.
+        self._repo_type: Optional[str] = None
+        self._revision: Optional[str] = None
+        # ``_hf_id`` is the identifier passed to ``hf-mount`` (bucket id for
+        # buckets; for repos it's e.g. ``datasets/ns/name`` — matching the
+        # argument format ``hf-mount repo`` expects).
+        self._hf_id: str = ''
+        # HF Buckets/repos do not have user-selectable regions.
+        super().__init__(name, source, region, is_sky_managed,
+                         sync_on_reconstruction, _bucket_sub_path)
+
+    @property
+    def is_repo(self) -> bool:
+        return self._repo_type is not None
+
+    def _classify(self) -> None:
+        """Populates ``_repo_type``/``_revision``/``_hf_id`` from source/name.
+
+        For repo mode, ``self.name`` must either be unset or match the
+        canonical HF identifier derived from the source URL — mismatches
+        are refused so misconfigurations fail loud.
+        """
+        if isinstance(self.source, str) and self.source.startswith(
+                huggingface.HF_URL_PREFIX) and not self.source.startswith(
+                    huggingface.HF_BUCKETS_URL_PREFIX):
+            repo_type, repo_id, revision, sub_path = (
+                data_utils.split_hf_repo_path(self.source))
+            if sub_path and getattr(self, '_bucket_sub_path', None) is None:
+                self._bucket_sub_path = sub_path
+            self._repo_type = repo_type
+            self._revision = revision
+            self._hf_id = self.hf_id_from_repo_parts(repo_type, repo_id)
+            if not self.name:
+                self.name = self._hf_id
+            elif self.name != self._hf_id:
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.StorageSpecError(
+                        f'Hugging Face {self._repo_type} source '
+                        f'{self.source!r} does not match storage name '
+                        f'{self.name!r}. Expected name to be '
+                        f'{self._hf_id!r} (or leave it unset).')
+        else:
+            # Bucket mode: ``self.name`` is the bucket id (ns/bucket).
+            self._repo_type = None
+            self._hf_id = self.name
+
+    def _validate(self) -> None:
+        self._classify()
+        if self.source is not None and isinstance(self.source, str):
+            if self.is_repo:
+                # Repo mode: source must be an hf:// URL matching the id.
+                if not data_utils.is_hf_path(self.source):
+                    raise exceptions.StorageSpecError(
+                        f'Hugging Face repo source {self.source!r} must start '
+                        f'with "{huggingface.HF_URL_PREFIX}".')
+                # Repo mounts are always read-only; COPY-mode upload isn't
+                # meaningful for a repo source.
+            elif data_utils.is_hf_bucket_path(self.source):
+                source_bucket_id, sub_path = data_utils.split_hf_path(
+                    self.source)
+                if sub_path and getattr(self, '_bucket_sub_path', None) is None:
+                    self._bucket_sub_path = sub_path
+                if self.name != source_bucket_id:
+                    with ux_utils.print_exception_no_traceback():
+                        raise exceptions.StorageSpecError(
+                            f'HF bucket is specified as path '
+                            f'({self.source}); storage name '
+                            f'({self.name!r}) must match the bucket id '
+                            f'({source_bucket_id!r}).')
+            elif re.search(r'^\w+://', self.source):
+                # A non-HF cloud URI; we don't support cross-cloud upload into
+                # HF Buckets in v1 (server-side Xet copy is HF<->HF only).
+                raise NotImplementedError(
+                    f'Moving data from {self.source} to a Hugging Face Bucket '
+                    'is not supported yet. Please download the data locally '
+                    'first, or use `hf buckets sync`.')
+            # Otherwise treat the source as a local path (validated by
+            # Storage._validate_source).
+
+        # Validate name.
+        self.name = self.validate_name(self.name, repo_type=self._repo_type)
+
+        if self.is_repo:
+            try:
+                huggingface.huggingface_hub.load_module()
+            except ImportError as e:
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.ResourcesUnavailableError(str(e)) from e
+        elif not _is_storage_cloud_enabled(huggingface.NAME):
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.ResourcesUnavailableError(
+                    'Storage \'store: hf\' specified, but Hugging Face '
+                    'credentials are not configured. Run `sky check` and set '
+                    'HF_TOKEN or run `hf auth login` to authenticate.')
+
+    @classmethod
+    def validate_name(cls, name: str, repo_type: Optional[str] = None) -> str:
+        """Validates a Hugging Face bucket or repo identifier.
+
+        Bucket ids are ``<namespace>/<bucket-name>``. Repo ids may additionally
+        be prefixed with ``datasets/`` or ``spaces/``.
+        """
+
+        def _raise(msg: str):
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageNameError(msg)
+
+        if not isinstance(name, str) or not name:
+            _raise('Hugging Face name must be specified in the form '
+                   '"<namespace>/<name>" (e.g. "my-user/my-bucket").')
+
+        # Accept full handles for convenience.
+        if name.startswith(huggingface.HF_BUCKETS_URL_PREFIX):
+            name = name[len(huggingface.HF_BUCKETS_URL_PREFIX):]
+        elif name.startswith(huggingface.HF_URL_PREFIX):
+            name = name[len(huggingface.HF_URL_PREFIX):]
+
+        # For repo mode, strip the type prefix matching the declared
+        # ``repo_type`` before validating segments. Prefixes belonging to
+        # *other* repo types (e.g. ``datasets/`` with ``repo_type='space'``)
+        # are not stripped, so such mismatches fall through to the segment
+        # count check and raise.
+        core = name
+        if repo_type:
+            expected_prefix = cls._REPO_TYPE_TO_URL_PREFIX.get(repo_type, '')
+            if expected_prefix and core.startswith(expected_prefix):
+                core = core[len(expected_prefix):]
+
+        parts = core.split('/')
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            kind = 'repo' if repo_type else 'bucket'
+            _raise(
+                f'Invalid Hugging Face {kind} name {name!r}. Expected format: '
+                '"<namespace>/<name>".')
+
+        for segment_kind, segment in (('namespace', parts[0]), ('name',
+                                                                parts[1])):
+            if not cls._NAME_PATTERN.match(segment):
+                kind = 'repo' if repo_type else 'bucket'
+                _raise(f'Invalid Hugging Face {kind} {segment_kind} '
+                       f'{segment!r}: must match '
+                       f'{cls._NAME_PATTERN.pattern} (letters, digits, '
+                       '".", "_", "-"; must not start with "." or "-").')
+        return name
+
+    def initialize(self) -> None:
+        """Initializes the HF bucket (creating if needed) or the repo handle.
+
+        Raises:
+            StorageBucketCreateError: If bucket creation fails.
+            StorageBucketGetError: If fetching an existing bucket/repo fails.
+            StorageInitError: If the HF SDK is not available or the user is
+              not authenticated (for private repos / any bucket).
+        """
+        token = huggingface.get_token()
+        # For public repos, authentication is optional.
+        if not token and not self.is_repo:
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageInitError(
+                    'Hugging Face token not found. Set HF_TOKEN or run '
+                    '`hf auth login`.')
+        self._token = token
+        self._api = huggingface.api()
+        if self.is_repo:
+            # Repos are never sky-managed; we only fetch metadata to verify
+            # the repo exists and is accessible.
+            self.bucket = self._get_repo_info()
+            if self.is_sky_managed is None:
+                self.is_sky_managed = False
+        else:
+            self.bucket, is_new_bucket = self._get_bucket()
+            if self.is_sky_managed is None:
+                self.is_sky_managed = is_new_bucket
+
+    def _get_repo_info(self) -> StorageHandle:
+        """Fetches repo metadata; raises if the repo is missing/inaccessible."""
+        errors = huggingface.hf_hub_errors()
+        assert self._repo_type is not None
+        try:
+            # ``HfApi.repo_info`` takes the raw ``ns/name`` id plus a
+            # ``repo_type`` kwarg ("model", "dataset", or "space").
+            repo_id = self.strip_repo_type_prefix(self._hf_id)
+            return self._api.repo_info(repo_id=repo_id,
+                                       repo_type=self._repo_type,
+                                       revision=self._revision,
+                                       token=self._token)
+        except Exception as e:  # pylint: disable=broad-except
+            not_found_types = tuple(cls for cls in (
+                getattr(errors, 'RepositoryNotFoundError', None),
+                getattr(errors, 'GatedRepoError', None),
+                getattr(errors, 'RevisionNotFoundError', None),
+            ) if cls is not None)
+            if isinstance(e, not_found_types):
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.StorageBucketGetError(
+                        f'Hugging Face {self._repo_type} '
+                        f'{self._hf_id!r} not found or inaccessible: '
+                        f'{e}') from e
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageBucketGetError(
+                    f'Failed to connect to Hugging Face {self._repo_type} '
+                    f'{self._hf_id!r}: {e}') from e
+
+    def _get_bucket(self) -> Tuple[StorageHandle, bool]:
+        """Gets the bucket, creating it if needed and allowed.
+
+        Returns:
+            (bucket_info, is_new_bucket)
+        """
+        errors = huggingface.hf_hub_errors()
+        try:
+            info = self._api.bucket_info(self.name, token=self._token)
+        except Exception as e:  # pylint: disable=broad-except
+            not_found_types = tuple(cls for cls in (
+                getattr(errors, 'RepositoryNotFoundError', None),
+                getattr(errors, 'EntryNotFoundError', None),
+            ) if cls is not None)
+            is_not_found = isinstance(e, not_found_types)
+            # ``HfHubHTTPError`` exposes ``.response.status_code``; treat 404
+            # and 403/401 separately.
+            status_code = None
+            response = getattr(e, 'response', None)
+            if response is not None:
+                status_code = getattr(response, 'status_code', None)
+            if status_code == 404:
+                is_not_found = True
+
+            if is_not_found:
+                if isinstance(self.source, str) and data_utils.is_hf_path(
+                        self.source):
+                    with ux_utils.print_exception_no_traceback():
+                        raise exceptions.StorageBucketGetError(
+                            'Attempted to connect to a non-existent HF '
+                            f'bucket as a source: {self.source}') from e
+                if self.sync_on_reconstruction:
+                    info = self._create_hf_bucket(self.name)
+                    return info, True
+                raise exceptions.StorageExternalDeletionError(
+                    'Attempted to fetch a non-existent HF bucket: '
+                    f'{self.name}') from e
+            if status_code in (401, 403):
+                with ux_utils.print_exception_no_traceback():
+                    raise exceptions.StorageBucketGetError(
+                        _BUCKET_FAIL_TO_CONNECT_MESSAGE.format(
+                            name=self.name)) from e
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageBucketGetError(
+                    f'Failed to connect to HF bucket {self.name!r}: '
+                    f'{e}') from e
+        # Validate after the connection succeeded so StorageSpecError (e.g.
+        # mounting an externally-created bucket without ``source:``) keeps
+        # its actionable message instead of being wrapped as a connection
+        # failure by the broad ``except`` above.
+        self._validate_existing_bucket()
+        return info, False
+
+    def _create_hf_bucket(self, bucket_id: str) -> StorageHandle:
+        """Creates an HF bucket with ``exist_ok=True`` for idempotency."""
+        try:
+            self._api.create_bucket(bucket_id, exist_ok=True, token=self._token)
+            info = self._api.bucket_info(bucket_id, token=self._token)
+        except Exception as e:  # pylint: disable=broad-except
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageBucketCreateError(
+                    f'Failed to create HF bucket {bucket_id!r}: {e}') from e
+        logger.info(f'  {colorama.Style.DIM}Created HF bucket '
+                    f'{bucket_id!r}{colorama.Style.RESET_ALL}')
+        return info
+
+    def upload(self) -> None:
+        """Uploads source to the HF bucket.
+
+        Supports:
+            - A single local directory (syncs its contents into the bucket).
+            - A list of local files/directories.
+            - A pre-existing HF bucket URI (no-op).
+
+        Repo-backed stores are read-only: ``upload()`` is a no-op iff the
+        source is the corresponding ``hf://`` URL, and an error otherwise, so
+        that misconfigurations (e.g. a local ``source`` paired with a repo
+        URL) never silently discard data.
+        """
+        if self.is_repo:
+            is_repo_source = (isinstance(self.source, str) and
+                              data_utils.is_hf_path(self.source) and
+                              not data_utils.is_hf_bucket_path(self.source))
+            if self.source is None or is_repo_source:
+                # No local data to upload; the source IS the HF repo.
+                return
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageUploadError(
+                    f'Cannot upload to Hugging Face {self._repo_type} '
+                    f'{self._hf_id!r}: repos are read-only. Only Hugging Face '
+                    'Buckets (hf://buckets/...) support uploads. Got '
+                    f'source={self.source!r}.')
+        try:
+            if isinstance(self.source, list):
+                self._sync_local_sources(self.source, create_dirs=True)
+            elif self.source is not None:
+                if data_utils.is_hf_bucket_path(self.source):
+                    # Already an HF bucket; nothing to do.
+                    return
+                self._sync_local_sources([self.source])
+        except exceptions.StorageUploadError:
+            raise
+        except Exception as e:  # pylint: disable=broad-except
+            raise exceptions.StorageUploadError(
+                f'Upload failed for store {self.name}') from e
+
+    def _sync_local_sources(self,
+                            source_path_list: List[Path],
+                            create_dirs: bool = False) -> None:
+        """Uploads local files/directories to the HF bucket.
+
+        Uses ``sync_bucket`` for directories (it only transfers changed files)
+        and ``batch_bucket_files`` for individual files.
+        """
+        sub_path = self._bucket_sub_path or ''
+
+        log_path = sky_logging.generate_tmp_logging_file_path(
+            _STORAGE_LOG_FILE_NAME)
+        dest = f'{huggingface.HF_BUCKETS_URL_PREFIX}{self.name}'
+        if sub_path:
+            dest = f'{dest}/{sub_path}'
+
+        if len(source_path_list) > 1:
+            source_message = f'{len(source_path_list)} paths'
+        else:
+            source_message = str(source_path_list[0])
+        sync_path = f'{source_message} -> {dest}'
+
+        with rich_utils.safe_status(
+                ux_utils.spinner_message(f'Syncing {sync_path}',
+                                         log_path=log_path)):
+            # Classify all sources up front so we fail loud on any missing
+            # path before kicking off uploads.
+            dir_uploads: List[Tuple[str, str]] = []
+            files_to_add: List[Tuple[str, str]] = []
+            for raw_path in source_path_list:
+                path = os.path.abspath(os.path.expanduser(str(raw_path)))
+                if os.path.isdir(path):
+                    dir_dest = dest
+                    if create_dirs:
+                        dir_dest = f'{dest}/{os.path.basename(path)}'
+                    dir_uploads.append((path, dir_dest))
+                elif os.path.isfile(path):
+                    remote_name = os.path.basename(path)
+                    if sub_path:
+                        remote_name = f'{sub_path}/{remote_name}'
+                    files_to_add.append((path, remote_name))
+                else:
+                    with ux_utils.print_exception_no_traceback():
+                        raise exceptions.StorageUploadError(
+                            f'Local source path does not exist: {path}')
+            # ``sync_bucket`` is already parallel internally (the HF SDK
+            # uploads files within a folder concurrently). A small pool
+            # here overlaps I/O between distinct source dirs.
+            if dir_uploads:
+                max_workers = min(len(dir_uploads), 4)
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=max_workers) as pool:
+                    futures = [
+                        pool.submit(self._api.sync_bucket,
+                                    p,
+                                    d,
+                                    token=self._token,
+                                    quiet=True) for p, d in dir_uploads
+                    ]
+                    for future in concurrent.futures.as_completed(futures):
+                        future.result()
+            if files_to_add:
+                self._api.batch_bucket_files(self.name,
+                                             add=files_to_add,
+                                             token=self._token)
+        logger.info(
+            ux_utils.finishing_message(f'Storage synced: {sync_path}',
+                                       log_path))
+
+    def delete(self) -> None:
+        if self.is_repo:
+            # Repos are external resources; nothing to delete.
+            return
+        if self._bucket_sub_path is not None and not self.is_sky_managed:
+            return self._delete_sub_path()
+        try:
+            self._api.delete_bucket(self.name,
+                                    missing_ok=True,
+                                    token=self._token)
+        except Exception as e:  # pylint: disable=broad-except
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageBucketDeleteError(
+                    f'Failed to delete HF bucket {self.name!r}: {e}') from e
+        logger.info(f'{colorama.Fore.GREEN}Deleted HF bucket '
+                    f'{self.name}.{colorama.Style.RESET_ALL}')
+
+    def _delete_sub_path(self) -> None:
+        assert self._bucket_sub_path is not None, 'bucket_sub_path is not set'
+        assert not self.is_repo, 'sub-path delete is not supported for repos'
+        sub_path = self._bucket_sub_path.rstrip('/')
+        # Collect all files under the sub-path and delete them in one batch.
+        try:
+            entries = list(
+                self._api.list_bucket_tree(self.name,
+                                           prefix=sub_path,
+                                           recursive=True,
+                                           token=self._token))
+            file_paths = [
+                e.path for e in entries if getattr(e, 'type', 'file') == 'file'
+            ]
+            if file_paths:
+                self._api.batch_bucket_files(self.name,
+                                             delete=file_paths,
+                                             token=self._token)
+        except Exception as e:  # pylint: disable=broad-except
+            with ux_utils.print_exception_no_traceback():
+                raise exceptions.StorageBucketDeleteError(
+                    f'Failed to delete objects under '
+                    f'{self.name}/{sub_path}: {e}') from e
+        logger.info(f'{colorama.Fore.GREEN}Deleted objects in HF bucket '
+                    f'{self.name}/{sub_path}.{colorama.Style.RESET_ALL}')
+
+    def get_handle(self) -> StorageHandle:
+        return self.bucket
+
+    def download_remote_dir(self, local_path: str) -> None:
+        """Downloads the contents of the HF bucket/repo into ``local_path``.
+
+        For buckets, uses ``sync_bucket``. For repos, uses
+        ``snapshot_download``.
+        """
+        os.makedirs(os.path.expanduser(local_path), exist_ok=True)
+        expanded = os.path.expanduser(local_path)
+        if self.is_repo:
+            # ``snapshot_download`` preserves repo-relative paths under
+            # ``local_dir``. For a sub-path source we stage into a temp dir
+            # and move only the sub-path contents so the caller receives
+            # the contents (not a doubled ``<dest>/<sub_path>/...`` tree).
+            repo_id = self.strip_repo_type_prefix(self._hf_id)
+            if self._bucket_sub_path:
+                sub_path = self._bucket_sub_path.rstrip('/')
+                tmp_dir = tempfile.mkdtemp()
+                try:
+                    self._api.snapshot_download(
+                        repo_id=repo_id,
+                        repo_type=self._repo_type,
+                        revision=self._revision,
+                        local_dir=tmp_dir,
+                        allow_patterns=[f'{sub_path}/*'],
+                        token=self._token)
+                    src_dir = os.path.join(tmp_dir, *sub_path.split('/'))
+                    if os.path.isdir(src_dir):
+                        for entry in os.listdir(src_dir):
+                            shutil.move(os.path.join(src_dir, entry),
+                                        os.path.join(expanded, entry))
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+            else:
+                self._api.snapshot_download(repo_id=repo_id,
+                                            repo_type=self._repo_type,
+                                            revision=self._revision,
+                                            local_dir=expanded,
+                                            allow_patterns=None,
+                                            token=self._token)
+            return
+        src = f'{huggingface.HF_BUCKETS_URL_PREFIX}{self.name}'
+        if self._bucket_sub_path:
+            src = f'{src}/{self._bucket_sub_path}'
+        self._api.sync_bucket(src, expanded, token=self._token, quiet=True)
+
+    def _download_file(self, remote_path: str, local_path: str) -> None:
+        """Downloads a single file from the HF bucket/repo to ``local_path``."""
+        if self.is_repo:
+            self._api.hf_hub_download(
+                repo_id=self.strip_repo_type_prefix(self._hf_id),
+                repo_type=self._repo_type,
+                revision=self._revision,
+                filename=remote_path,
+                local_dir=os.path.dirname(local_path) or '.',
+                token=self._token)
+            return
+        # ``download_bucket_files`` accepts (remote_path, local_path) pairs.
+        self._api.download_bucket_files(self.name,
+                                        files=[(remote_path, local_path)],
+                                        token=self._token)
+
+    def _allow_patterns_for_sub_path(self) -> Optional[List[str]]:
+        """Translates ``_bucket_sub_path`` into ``snapshot_download`` glob."""
+        if not self._bucket_sub_path:
+            return None
+        return [f'{self._bucket_sub_path.rstrip("/")}/*']
+
+    def mount_command(self,
+                      mount_path: str,
+                      read_only: bool = False,
+                      hf_mount_args: Optional[List[str]] = None) -> str:
+        """Returns a command to mount the HF bucket/repo at ``mount_path``.
+
+        Uses the ``hf-mount`` NFS backend. The token file is expected to be
+        available on the remote host (it is synced via
+        ``huggingface.get_credential_file_mounts``).
+
+        ``hf_mount_args`` are extra ``hf-mount`` flags (from
+        ``config.mount.hf_mount_args``) forwarded verbatim to the daemon,
+        e.g. ``--cache-dir`` / ``--cache-size`` / ``--advanced-writes``.
+        """
+        install_cmd = mounting_utils.get_hf_mount_install_cmd()
+        mount_cmd = mounting_utils.get_hf_mount_cmd(
+            hf_id=self._hf_id,
+            mount_path=mount_path,
+            _bucket_sub_path=self._bucket_sub_path,
+            read_only=read_only,
+            mode='repo' if self.is_repo else 'bucket',
+            revision=self._revision,
+            extra_args=hf_mount_args)
+        version_check_cmd = mounting_utils.get_hf_mount_version_check_cmd()
+        return mounting_utils.get_mounting_command(mount_path, install_cmd,
+                                                   mount_cmd, version_check_cmd)
+
+    def mount_cached_command(self,
+                             mount_path: str,
+                             config: Optional[MountCachedConfig] = None) -> str:
+        """Returns a command to mount the HF bucket/repo with local caching.
+
+        ``hf-mount`` already provides an on-disk chunk cache (configured via
+        its own ``--cache-dir`` / ``--cache-size`` flags; not currently
+        exposed), so this reuses :meth:`mount_command`. Of
+        ``MountCachedConfig``'s fields, only ``read_only`` maps cleanly to
+        ``hf-mount`` (as ``--read-only`` on bucket mounts; repo mounts are
+        always read-only). The rclone-specific fields (``transfers``,
+        ``buffer_size``, ``vfs_*``) have no ``hf-mount`` equivalent and are
+        silently ignored.
+        """
+        read_only = bool(config.read_only) if config is not None else False
+        return self.mount_command(mount_path, read_only=read_only)

@@ -156,7 +156,7 @@ class Resources:
     """
     # If any fields changed, increment the version. For backward compatibility,
     # modify the __setstate__ method to handle the old version.
-    _VERSION = 33  # add _hooks list + scrub AutostopConfig.hook/hook_timeout.
+    _VERSION = 36  # add _kubernetes_identity, _remote_identity_none.
 
     def __init__(
         self,
@@ -174,7 +174,6 @@ class Resources:
         zone: Optional[str] = None,
         image_id: Union[Dict[Optional[str], str], str, None] = None,
         disk_size: Optional[Union[str, int]] = None,
-        ephemeral_storage: Optional[Union[str, int]] = None,
         disk_tier: Optional[Union[str, resources_utils.DiskTier]] = None,
         network_tier: Optional[Union[str, resources_utils.NetworkTier]] = None,
         local_disk: Optional[str] = None,
@@ -355,6 +354,7 @@ class Resources:
                     job_recovery['strategy'] = strategy_name.upper()
                 self._job_recovery = job_recovery
 
+        self._disk_size: Optional[int] = None
         if disk_size is not None:
             self._disk_size = int(
                 resources_utils.parse_memory_resource(disk_size, 'disk_size'))
@@ -363,27 +363,44 @@ class Resources:
                     raise ValueError(
                         '"disk_size" must be a positive integer (in GB). '
                         f'Got: {disk_size!r}.')
-        else:
-            self._disk_size = DEFAULT_DISK_SIZE_GB
-
-        if ephemeral_storage is not None:
-            self._ephemeral_storage: Optional[int] = int(
-                resources_utils.parse_memory_resource(ephemeral_storage,
-                                                      'ephemeral_storage'))
-        else:
-            self._ephemeral_storage = None
 
         self._image_id: Optional[Dict[Optional[str], str]] = None
+        self._docker_image: Optional[str] = None
         if isinstance(image_id, str):
             self._image_id = {self._region: image_id.strip()}
         elif isinstance(image_id, dict):
-            if None in image_id:
+            image_id = dict(image_id)
+            # 'docker' is a reserved key for specifying a Docker image
+            # alongside a cloud VM image.
+            if 'docker' in image_id:
+                docker_val = image_id.pop('docker').strip()
+                if docker_val.startswith('docker:'):
+                    docker_val = docker_val[len('docker:'):]
+                self._docker_image = docker_val
+            if not image_id:
+                self._image_id = None
+            elif None in image_id:
                 self._image_id = {self._region: image_id[None].strip()}
             else:
                 self._image_id = {
                     typing.cast(str, k).strip(): v.strip()
                     for k, v in image_id.items()
                 }
+            # Reject ambiguous specs: docker key + docker:-prefixed region
+            # values (e.g. {us-east-1: 'docker:img1', docker: 'img2'}).
+            if self._docker_image is not None and self._image_id is not None:
+                docker_prefixed = [
+                    f'{v} (region: {k})' for k, v in self._image_id.items()
+                    if v.startswith('docker:')
+                ]
+                if docker_prefixed:
+                    with ux_utils.print_exception_no_traceback():
+                        raise ValueError(
+                            'image_id has both a \'docker\' key and '
+                            'docker:-prefixed region values: '
+                            f'{", ".join(docker_prefixed)}. '
+                            'Please use only one mechanism to specify '
+                            'the Docker image.')
         else:
             self._image_id = image_id
         if isinstance(self._cloud, clouds.Kubernetes):
@@ -448,6 +465,12 @@ class Resources:
         self._requires_fuse = _requires_fuse
 
         self._cluster_config_overrides = _cluster_config_overrides
+        # Not a constructor argument and never in YAML, so a requester cannot
+        # set it: only a cluster SkyPilot launches in-process for itself does.
+        self._kubernetes_identity: Optional[str] = None
+        # Recorded from the rendered cluster config when a Kubernetes cluster
+        # is launched; None until then (and for clusters from older versions).
+        self._remote_identity_none: Optional[bool] = None
         self._cached_repr: Optional[str] = None
         self._no_missing_accel_warnings = _no_missing_accel_warnings
 
@@ -480,7 +503,7 @@ class Resources:
         self._try_validate_labels()
         self._try_validate_local_disk()
         self._try_validate_max_hourly_cost()
-        self._try_validate_ephemeral_storage()
+        self._try_validate_tpu_multi_host()
 
     # When querying the accelerators inside this func (we call self.accelerators
     # which is a @property), we will check the cloud's catalog, which can error
@@ -534,11 +557,16 @@ class Resources:
             use_spot = '[Spot]'
 
         image_id = ''
+        image_parts = []
         if self.image_id is not None:
             if None in self.image_id:
-                image_id = f', image_id={self.image_id[None]}'
+                image_parts.append(f'{self.image_id[None]}')
             else:
-                image_id = f', image_id={self.image_id}'
+                image_parts.append(f'{self.image_id}')
+        if self._docker_image is not None:
+            image_parts.append(f'docker:{self._docker_image}')
+        if image_parts:
+            image_id = f', image_id={" | ".join(image_parts)}'
 
         disk_tier = ''
         if self.disk_tier is not None:
@@ -560,11 +588,6 @@ class Resources:
         if self.disk_size != DEFAULT_DISK_SIZE_GB:
             disk_size = f', disk_size={self.disk_size}'
 
-        ephemeral_storage = ''
-        if self._ephemeral_storage is not None:
-            ephemeral_storage = (
-                f', ephemeral_storage={self._ephemeral_storage}')
-
         ports = ''
         if self.ports is not None:
             ports = f', ports={self.ports}'
@@ -580,7 +603,7 @@ class Resources:
         hardware_str = (
             f'{instance_type}{use_spot}'
             f'{cpus}{memory}{accelerators}{accelerator_args}{image_id}'
-            f'{disk_tier}{network_tier}{disk_size}{ephemeral_storage}'
+            f'{disk_tier}{network_tier}{disk_size}'
             f'{local_disk}{max_hourly_cost}{ports}')
         # It may have leading ',' (for example, instance_type not set) or empty
         # spaces.  Remove them.
@@ -705,11 +728,13 @@ class Resources:
 
     @property
     def disk_size(self) -> int:
-        return self._disk_size
+        if self._disk_size is not None:
+            return self._disk_size
+        return DEFAULT_DISK_SIZE_GB
 
     @property
-    def ephemeral_storage(self) -> Optional[int]:
-        return self._ephemeral_storage
+    def disk_size_specified(self) -> bool:
+        return self._disk_size is not None
 
     @property
     def image_id(self) -> Optional[Dict[Optional[str], str]]:
@@ -807,6 +832,24 @@ class Resources:
         # TODO(zeping): This violates the immutability of Resources.
         #  Refactor to use Resources.copy instead.
         self._requires_fuse = value
+
+    @property
+    def kubernetes_identity(self) -> Optional[str]:
+        """A fixed Kubernetes service account, exempt from remote_identity."""
+        return self._kubernetes_identity
+
+    def set_kubernetes_identity(self, service_account: Optional[str]) -> None:
+        # Mutates in place like set_requires_fuse: the task's resources are
+        # shared with the dag the launch already holds.
+        self._kubernetes_identity = service_account
+
+    @property
+    def remote_identity_none_at_launch(self) -> Optional[bool]:
+        """Whether its launched pods got no Kubernetes token, if known."""
+        return self._remote_identity_none
+
+    def set_remote_identity_none_at_launch(self, value: Optional[bool]) -> None:
+        self._remote_identity_none = value
 
     @property
     def cluster_config_overrides(self) -> Dict[str, Any]:
@@ -943,7 +986,12 @@ class Resources:
                 # Fix the logic such that GCP TPU names can failover between
                 # GCP and kubernetes.
                 if self.cloud is None:
-                    if kubernetes_utils.is_tpu_on_gke(acc, normalize=False):
+                    # accelerator_args.multi_host only exists on Kubernetes,
+                    # so it also resolves a GCP TPU name (tpu-v6e-8) to
+                    # Kubernetes (and never gets a GCP runtime_version).
+                    if (kubernetes_utils.is_tpu_on_gke(acc, normalize=False) or
+                            kubernetes_utils.multi_host_requested(
+                                accelerator_args)):
                         self._cloud = clouds.Kubernetes()
                     else:
                         self._cloud = clouds.GCP()
@@ -1476,6 +1524,8 @@ class Resources:
                 raise
 
     def extract_docker_image(self) -> Optional[str]:
+        if self._docker_image is not None:
+            return self._docker_image
         if self.image_id is None:
             return None
         # Handle dict image_id
@@ -1487,6 +1537,24 @@ class Resources:
                 if image_id.startswith('docker:'):
                     return image_id[len('docker:'):]
         return None
+
+    def get_cloud_image_id(self) -> Optional[Dict[Optional[str], str]]:
+        """Returns the cloud VM image_id, or None if only a docker image.
+
+        When both a cloud image and a docker image are specified (via the
+        'docker' key), returns just the cloud image portion. For the legacy
+        'image_id: docker:xxx' format, returns None since there is no
+        separate cloud image.
+        """
+        if self._image_id is None:
+            return None
+        # Filter out any docker:-prefixed entries (legacy format).
+        cloud_only = {
+            k: v
+            for k, v in self._image_id.items()
+            if not v.startswith('docker:')
+        }
+        return cloud_only if cloud_only else None
 
     def _try_validate_image_id(self) -> None:
         """Try to validate the image_id attribute.
@@ -1526,14 +1594,26 @@ class Resources:
                             f'(prefix with "docker:"), or '
                             f'(2) leave image_id empty to use the default')
 
-        if self._image_id is None:
+        if self._image_id is None and self._docker_image is None:
             return
 
-        if self.extract_docker_image() is not None:
-            # TODO(tian): validate the docker image exists / of reasonable size
+        if self._docker_image is not None:
             if self.cloud is not None:
                 self.cloud.check_features_are_supported(
                     self, {clouds.CloudImplementationFeatures.DOCKER_IMAGE})
+            if self._image_id is None:
+                return
+
+        if (self._image_id is not None and
+                self.extract_docker_image() is not None):
+            # Legacy docker: prefix in image_id (no separate _docker_image)
+            if self._docker_image is None:
+                if self.cloud is not None:
+                    self.cloud.check_features_are_supported(
+                        self, {clouds.CloudImplementationFeatures.DOCKER_IMAGE})
+                return
+
+        if self._image_id is None:
             return
 
         if self.cloud is None:
@@ -1766,6 +1846,41 @@ class Resources:
                         f'Specified instance type {self._instance_type} does '
                         f'not have specified local disk {self._local_disk}.')
 
+    def _try_validate_tpu_multi_host(self) -> None:
+        """``accelerator_args.multi_host`` is only accepted as True, for an
+        8-chip TPU v6e slice on Kubernetes (the one size that exists both as
+        one VM and as a multi-host slice)."""
+        if (self._accelerator_args is None or
+                'multi_host' not in self._accelerator_args):
+            return
+        multi_host = self._accelerator_args['multi_host']
+        usage = ('`accelerator_args.multi_host` is only supported as `true` '
+                 'with `accelerators: tpu-v6e-8` (or `tpu-v6e-slice:8`) on '
+                 'Kubernetes.')
+        with ux_utils.print_exception_no_traceback():
+            if multi_host is not True:
+                raise ValueError(
+                    f'{usage} Got multi_host={multi_host!r}; remove the field '
+                    'instead of setting it to false.')
+            accelerators = self._accelerators or {}
+            shape = None
+            if len(accelerators) == 1:
+                acc, count = next(iter(accelerators.items()))
+                if kubernetes_utils.is_tpu_on_gke(acc):
+                    acc_type, chips = (
+                        kubernetes_utils.normalize_tpu_accelerator(acc, count))
+                    # A GCP name carries its count in the name, so an extra
+                    # count (tpu-v6e-8:2) is ambiguous here.
+                    if (acc_type, chips) in (
+                            kubernetes_utils.OPT_IN_MULTI_HOST_SHAPES) and (
+                                acc == acc_type or count in (None, 1)):
+                        shape = (acc_type, chips)
+            if shape is None:
+                raise ValueError(f'{usage} Got accelerators={accelerators!r}.')
+            if self._cloud is not None and not isinstance(
+                    self._cloud, clouds.Kubernetes):
+                raise ValueError(f'{usage} Got cloud {self._cloud}.')
+
     def _try_validate_max_hourly_cost(self):
         if self._max_hourly_cost is not None:
             if not isinstance(self._max_hourly_cost, (int, float)):
@@ -1779,30 +1894,49 @@ class Resources:
                         'max_hourly_cost must be a positive number, '
                         f'got {self._max_hourly_cost}')
 
-    def _try_validate_ephemeral_storage(self) -> None:
-        if self._ephemeral_storage is None:
-            return
-        if self.cloud is not None and not isinstance(self.cloud,
-                                                     clouds.Kubernetes):
-            with ux_utils.print_exception_no_traceback():
-                raise ValueError(
-                    'ephemeral_storage is only supported on Kubernetes, '
-                    f'not on {self.cloud}.')
+    def _get_hourly_cost(self, region: Optional[str],
+                         zone: Optional[str]) -> float:
+        """Returns the joint hourly price of the instance and accelerators."""
+        assert self.cloud is not None, 'Cloud must be specified'
+        assert self._instance_type is not None, (
+            'Instance type must be specified')
+        # Instance.
+        hourly_cost = self.cloud.instance_type_to_hourly_cost(
+            self._instance_type, self.use_spot, region, zone)
+        # Accelerators (if any).
+        if self.accelerators is not None:
+            hourly_cost += self.cloud.accelerators_to_hourly_cost(
+                self.accelerators, self.use_spot, region, zone)
+        return hourly_cost
 
     def get_cost(self, seconds: float) -> float:
         """Returns cost in USD for the runtime in seconds."""
         hours = seconds / 3600
-        # Instance.
         assert self.cloud is not None, 'Cloud must be specified'
         assert self._instance_type is not None, (
             'Instance type must be specified')
-        hourly_cost = self.cloud.instance_type_to_hourly_cost(
-            self._instance_type, self.use_spot, self._region, self._zone)
-        # Accelerators (if any).
-        if self.accelerators is not None:
-            hourly_cost += self.cloud.accelerators_to_hourly_cost(
-                self.accelerators, self.use_spot, self._region, self._zone)
-        return float(hourly_cost * hours)
+        if self._region is None:
+            # Without a pinned region, pricing the instance and the
+            # accelerators independently would take each component's minimum
+            # across all regions, which can combine prices from different
+            # regions into a total that no single region offers (e.g., GCP
+            # a2-megagpu-16g is cheapest in us-central1 while A100 is cheapest
+            # in europe-west4). Take the cheapest *joint* price over the
+            # regions that actually offer these resources instead.
+            hourly_costs = []
+            for region in self.get_valid_regions_for_launchable():
+                try:
+                    hourly_costs.append(self._get_hourly_cost(
+                        region.name, None))
+                except ValueError:
+                    # The instance type or accelerator has no price listed in
+                    # this region.
+                    continue
+            if hourly_costs:
+                return float(min(hourly_costs) * hours)
+            # No region-specific price found; fall through to the region-free
+            # catalog lookup below.
+        return float(self._get_hourly_cost(self._region, self._zone) * hours)
 
     def get_accelerators_str(self) -> str:
         accelerators = self.accelerators
@@ -1988,6 +2122,9 @@ class Resources:
                     return False
         # self.accelerators <= other.accelerators
 
+        # This also tells a multi-host TPU slice (accelerator_args.multi_host)
+        # from a single VM of the same chip count. A CPU-only request has no
+        # accelerator_args, so it fits either cluster.
         if (self.accelerator_args is not None and
                 self.accelerator_args != other.accelerator_args):
             return False
@@ -2077,10 +2214,11 @@ class Resources:
             self._accelerators is None,
             self._accelerator_args is None,
             not self._use_spot_specified,
-            self._disk_size == DEFAULT_DISK_SIZE_GB,
+            self._disk_size is None,
             self._disk_tier is None,
             self._network_tier is None,
             self._image_id is None,
+            self._docker_image is None,
             self._ports is None,
             self._docker_login_config is None,
         ])
@@ -2188,15 +2326,33 @@ class Resources:
         if current_override_configs is None:
             current_override_configs = {}
         new_override_configs = override.pop('_cluster_config_overrides', {})
-        overlaid_configs = skypilot_config.overlay_skypilot_config(
-            original_config=config_utils.Config(current_override_configs),
-            override_configs=new_override_configs,
-        )
-        override_configs = config_utils.Config()
+        # Only the incoming overrides are filtered to the overrideable
+        # keys. The existing overrides are kept as-is: they were already
+        # accepted when this Resources was constructed, and on the client
+        # the full set of overrideable keys is not known (the server may
+        # register additional keys via
+        # skypilot_config.register_task_overrideable_config_key), so
+        # re-filtering here would silently drop them before the server
+        # can act on them.
+        filtered_new_configs = config_utils.Config()
+        new_configs = config_utils.Config(new_override_configs or {})
+        missing = object()
         for key in constants.OVERRIDEABLE_CONFIG_KEYS_IN_TASK:
-            elem = overlaid_configs.get_nested(key, None)
-            if elem is not None:
-                override_configs.set_nested(key, elem)
+            elem = new_configs.get_nested(key, missing)
+            if elem is not missing:
+                # Explicit null values are kept so they can clear an
+                # existing override below.
+                filtered_new_configs.set_nested(key, elem)
+        override_configs = skypilot_config.overlay_skypilot_config(
+            original_config=config_utils.Config(current_override_configs),
+            override_configs=filtered_new_configs,
+        )
+        # A null-valued overrideable key (e.g. `--config gcp.vpc_name=null`)
+        # clears the task-level override so the CLI/global config value takes
+        # effect, instead of the existing task value surviving the overlay.
+        for key in constants.OVERRIDEABLE_CONFIG_KEYS_IN_TASK:
+            if override_configs.get_nested(key, missing) is None:
+                override_configs.pop_nested(key, None)
 
         current_autostop_config = None
         if self.autostop_config is not None:
@@ -2208,6 +2364,13 @@ class Resources:
             hooks_override)
 
         override_configs = dict(override_configs) if override_configs else None
+        # Reconstruct the 'docker' key in image_id so _docker_image is preserved
+        # across the copy, since self.image_id excludes the popped 'docker' key.
+        default_image_id = self.image_id
+        if self._docker_image is not None:
+            image_id_dict = dict(default_image_id) if default_image_id else {}
+            image_id_dict['docker'] = self._docker_image
+            default_image_id = image_id_dict
         resources = Resources(
             cloud=override.pop('cloud', self.cloud),
             instance_type=override.pop('instance_type', self.instance_type),
@@ -2221,12 +2384,10 @@ class Resources:
                                           self.accelerator_args),
             use_spot=override.pop('use_spot', use_spot),
             job_recovery=override.pop('job_recovery', self.job_recovery),
-            disk_size=override.pop('disk_size', self.disk_size),
-            ephemeral_storage=override.pop('ephemeral_storage',
-                                           self._ephemeral_storage),
+            disk_size=override.pop('disk_size', self._disk_size),
             region=override.pop('region', self.region),
             zone=override.pop('zone', self.zone),
-            image_id=override.pop('image_id', self.image_id),
+            image_id=override.pop('image_id', default_image_id),
             disk_tier=override.pop('disk_tier', self.disk_tier),
             network_tier=override.pop('network_tier', self.network_tier),
             local_disk=override.pop('local_disk', self._local_disk),
@@ -2252,6 +2413,8 @@ class Resources:
             _no_missing_accel_warnings=override.pop(
                 'no_missing_accel_warnings', self._no_missing_accel_warnings),
         )
+        resources.set_kubernetes_identity(self._kubernetes_identity)
+        resources.set_remote_identity_none_at_launch(self._remote_identity_none)
         assert not override
         return resources
 
@@ -2280,7 +2443,7 @@ class Resources:
             features.add(clouds.CloudImplementationFeatures.CUSTOM_NETWORK_TIER)
         if self.extract_docker_image() is not None:
             features.add(clouds.CloudImplementationFeatures.DOCKER_IMAGE)
-        elif self.image_id is not None:
+        if self.get_cloud_image_id() is not None:
             features.add(clouds.CloudImplementationFeatures.IMAGE_ID)
         if self.ports is not None:
             features.add(clouds.CloudImplementationFeatures.OPEN_PORTS)
@@ -2565,8 +2728,6 @@ class Resources:
             # exclusive by the schema validation.
             resources_fields['job_recovery'] = config.pop('job_recovery', None)
         resources_fields['disk_size'] = config.pop('disk_size', None)
-        resources_fields['ephemeral_storage'] = config.pop(
-            'ephemeral_storage', None)
         resources_fields['image_id'] = config.pop('image_id', None)
         resources_fields['disk_tier'] = config.pop('disk_tier', None)
         resources_fields['network_tier'] = config.pop('network_tier', None)
@@ -2587,8 +2748,28 @@ class Resources:
         resources_fields['_is_image_managed'] = config.pop(
             '_is_image_managed', None)
         resources_fields['_requires_fuse'] = config.pop('_requires_fuse', None)
-        resources_fields['_cluster_config_overrides'] = config.pop(
-            '_cluster_config_overrides', None)
+        cluster_config_overrides = config.pop('_cluster_config_overrides', None)
+        if cluster_config_overrides:
+            # A task's `config` field crosses the client/server boundary as
+            # `resources._cluster_config_overrides`, whose entry in the
+            # resources schema is just `{'type': 'object'}` — so unlike
+            # `job_recovery`, the resources-schema validation above does not
+            # cover its contents. Re-validate against the task-level config
+            # schema here: on the server (plugins loaded) this is the strict,
+            # plugin-aware schema, so keys and value shapes a lenient client
+            # passed through are enforced at deserialization.
+            # skip_none=False: the default strips top-level None-valued
+            # keys before validating, which would let an unknown section
+            # through as long as its value is null (it survives into the
+            # overrides regardless). Nested nulls are untouched either
+            # way, so `--config gcp.vpc_name=null` still validates.
+            common_utils.validate_schema(
+                cluster_config_overrides,
+                schemas.get_task_schema()['properties']['config'],
+                'Invalid resources.config override: ',
+                skip_none=False)
+        resources_fields['_cluster_config_overrides'] = (
+            cluster_config_overrides)
 
         if resources_fields['cpus'] is not None:
             resources_fields['cpus'] = str(resources_fields['cpus'])
@@ -2598,17 +2779,30 @@ class Resources:
             resources_fields['accelerator_args'] = dict(
                 resources_fields['accelerator_args'])
         if resources_fields['disk_size'] is not None:
-            # although it will end up being an int, we don't know at this point
-            # if it has units or not, so we store it as a string
-            resources_fields['disk_size'] = str(resources_fields['disk_size'])
-        if resources_fields['ephemeral_storage'] is not None:
-            resources_fields['ephemeral_storage'] = str(
-                resources_fields['ephemeral_storage'])
+            # TODO (kyuds): remove after v0.14.0
+            disk_size_val = int(
+                resources_utils.parse_memory_resource(
+                    str(resources_fields['disk_size']), 'disk_size'))
+            if disk_size_val == DEFAULT_DISK_SIZE_GB:
+                # Treat the default value as unspecified so that older
+                # configs that always emitted disk_size: 256 don't
+                # trigger ephemeral-storage requests on Kubernetes.
+                resources_fields['disk_size'] = None
+            else:
+                # although it will end up being an int, we don't know at
+                # this point if it has units or not, so we store as string
+                resources_fields['disk_size'] = str(
+                    resources_fields['disk_size'])
         if resources_fields['local_disk'] is not None:
             # may be integer by only specifying exact size.
             resources_fields['local_disk'] = str(resources_fields['local_disk'])
         resources_fields['_no_missing_accel_warnings'] = config.pop(
             '_no_missing_accel_warnings', None)
+
+        # Deprecated fields that may still appear in configs written by
+        # older SkyPilot versions. Pop them so the assertion below doesn't
+        # fire. ephemeral_storage was removed in favor of disk_size.
+        config.pop('ephemeral_storage', None)
 
         assert not config, f'Invalid resource args: {config.keys()}'
         return Resources(**resources_fields)
@@ -2636,9 +2830,13 @@ class Resources:
         if self._use_spot_specified:
             add_if_not_none('use_spot', self.use_spot)
         add_if_not_none('job_recovery', self.job_recovery)
-        add_if_not_none('disk_size', self.disk_size)
-        add_if_not_none('ephemeral_storage', self._ephemeral_storage)
-        add_if_not_none('image_id', self.image_id)
+        add_if_not_none('disk_size', self._disk_size)
+        image_id_config = self.image_id
+        if self._docker_image is not None:
+            image_id_dict = dict(image_id_config) if image_id_config else {}
+            image_id_dict['docker'] = self._docker_image
+            image_id_config = image_id_dict
+        add_if_not_none('image_id', image_id_config)
         if self.disk_tier is not None:
             config['disk_tier'] = self.disk_tier.value
         if self.network_tier is not None:
@@ -2690,6 +2888,21 @@ class Resources:
         if self._requires_fuse is not None:
             config['_requires_fuse'] = self._requires_fuse
         return config
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Persist whether disk_size was explicitly specified, and ensure
+        # _disk_size is always serialized as int so that older SkyPilot
+        # versions (which expect int) can unpickle safely.
+        state['_disk_size_specified'] = state.get('_disk_size') is not None
+        # TODO (kyuds): remove the always serialized to int and forward compat
+        # in v0.14.0
+        if state['_disk_size'] is None:
+            state['_disk_size'] = DEFAULT_DISK_SIZE_GB
+        # Forward compat: older versions expect _ephemeral_storage to exist
+        # (it was removed in this version in favor of disk_size).
+        state.setdefault('_ephemeral_storage', None)
+        return state
 
     def __setstate__(self, state):
         """Set state from pickled state, for backward compatibility."""
@@ -2861,8 +3074,19 @@ class Resources:
         if version < 31:
             self._max_hourly_cost = None
 
-        if version < 32:
-            self._ephemeral_storage = None
+        if version < 34:
+            self._docker_image = None
+
+        if version < 36:
+            self._kubernetes_identity = None
+            self._remote_identity_none = None
+
+        if version < 35:
+            state.pop('_ephemeral_storage', None)
+            if isinstance(state.get('_cloud', None), clouds.Kubernetes):
+                state['_disk_size'] = None
+        elif not state['_disk_size_specified']:
+            state['_disk_size'] = None
 
         if version < 33:
             # Route legacy AutostopConfig.hook / hook_timeout attrs into the

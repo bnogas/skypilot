@@ -419,6 +419,7 @@ def generate_cli_reference():
         'volumes': 'Volume Commands',
         'api': 'API Server Commands',
         'ssh': 'SSH Node Pool Commands',
+        'workspace': 'Workspace Commands',
     }
 
     for group_name, section_title in group_sections.items():
@@ -597,6 +598,7 @@ def generate_python_sdk():
         'Job Operations': [
             'queue',
             'job_status',
+            'cluster_job_spec',
             'cancel',
             'tail_logs',
             'tail_provision_logs',
@@ -650,6 +652,8 @@ def generate_python_sdk():
             'stream_and_get',
             'api_get',
             'workspaces',
+            'set_preferred_workspace',
+            'get_user_workspace',
         ],
     }
 

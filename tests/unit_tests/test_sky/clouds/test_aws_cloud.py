@@ -7,6 +7,156 @@ import pytest
 from sky.clouds import aws as aws_mod
 
 
+class TestVpcFailoverOverrides:
+
+    @pytest.fixture(autouse=True)
+    def clear_vpc_region_cache(self):
+        aws_mod._filter_vpc_names_by_region.cache_clear()
+
+    @pytest.mark.parametrize(
+        ('region', 'expected_vpc'),
+        [
+            ('us-east-1', 'primary-vpc'),
+            ('us-east-2', 'secondary-vpc'),
+        ],
+    )
+    @mock.patch.object(aws_mod.skypilot_config,
+                       'get_effective_region_config',
+                       return_value=['primary-vpc', 'secondary-vpc'])
+    @mock.patch.object(aws_mod, 'aws')
+    def test_yields_only_vpcs_in_requested_region(self, mock_aws, _, region,
+                                                  expected_vpc):
+        ec2 = mock_aws.resource.return_value
+
+        def find_vpcs(*, Filters):
+            return [mock.Mock()] if Filters[0]['Values'] == [expected_vpc
+                                                            ] else []
+
+        ec2.vpcs.filter.side_effect = find_vpcs
+
+        assert list(
+            aws_mod.AWS.yield_cloud_specific_failover_overrides(
+                region=region)) == [{
+                    'vpc_name': expected_vpc
+                }]
+        mock_aws.resource.assert_called_once_with('ec2', region_name=region)
+
+    @mock.patch.object(aws_mod.skypilot_config,
+                       'get_effective_region_config',
+                       return_value=['missing-one', 'missing-two'])
+    @mock.patch.object(aws_mod, 'aws')
+    def test_preserves_configured_vpc_when_no_candidates_match(
+            self, mock_aws, _):
+        ec2 = mock_aws.resource.return_value
+        ec2.vpcs.filter.return_value = []
+
+        assert list(
+            aws_mod.AWS.yield_cloud_specific_failover_overrides(
+                region='us-east-1')) == [{
+                    'vpc_name': 'missing-one'
+                }]
+        mock_aws.resource.assert_called_once_with('ec2',
+                                                  region_name='us-east-1')
+
+    @mock.patch.object(aws_mod.skypilot_config,
+                       'get_effective_region_config',
+                       return_value='primary-vpc')
+    @mock.patch.object(aws_mod, 'aws')
+    def test_singular_vpc_does_not_lookup_or_change(self, mock_aws, _):
+        assert list(
+            aws_mod.AWS.yield_cloud_specific_failover_overrides(
+                region='us-east-1')) == [{
+                    'vpc_name': 'primary-vpc'
+                }]
+        mock_aws.resource.assert_not_called()
+
+    @mock.patch.object(aws_mod.skypilot_config,
+                       'get_effective_region_config',
+                       return_value=['primary-vpc', 'secondary-vpc'])
+    @mock.patch.object(aws_mod, 'aws')
+    def test_unscoped_request_preserves_all_configured_vpcs(self, mock_aws, _):
+        assert list(
+            aws_mod.AWS.yield_cloud_specific_failover_overrides(
+                region=None)) == [{
+                    'vpc_name': 'primary-vpc'
+                }, {
+                    'vpc_name': 'secondary-vpc'
+                }]
+        mock_aws.resource.assert_not_called()
+
+    @mock.patch.object(aws_mod.skypilot_config,
+                       'get_effective_region_config',
+                       return_value=['primary-vpc', 'secondary-vpc'])
+    @mock.patch.object(aws_mod.aws, 'resource')
+    def test_vpc_lookup_error_preserves_existing_failover_behavior(
+            self, mock_resource, _):
+        error = aws_mod.aws.botocore_exceptions().ClientError(
+            {
+                'Error': {
+                    'Code': 'UnauthorizedOperation',
+                    'Message': 'not authorized',
+                }
+            }, 'DescribeVpcs')
+        mock_resource.return_value.vpcs.filter.side_effect = error
+
+        assert list(
+            aws_mod.AWS.yield_cloud_specific_failover_overrides(
+                region='us-east-1')) == [{
+                    'vpc_name': 'primary-vpc'
+                }, {
+                    'vpc_name': 'secondary-vpc'
+                }]
+        mock_resource.assert_called_once_with('ec2', region_name='us-east-1')
+
+    @mock.patch.object(aws_mod.skypilot_config,
+                       'get_effective_region_config',
+                       return_value=['primary-vpc', 'secondary-vpc'])
+    @mock.patch.object(aws_mod.aws, 'resource')
+    def test_vpc_lookup_error_is_not_cached(self, mock_resource, _):
+        error = aws_mod.aws.botocore_exceptions().ClientError(
+            {'Error': {
+                'Code': 'UnauthorizedOperation',
+                'Message': 'denied'
+            }}, 'DescribeVpcs')
+        mock_resource.return_value.vpcs.filter.side_effect = [
+            error,
+            [mock.Mock()],
+            [],
+        ]
+
+        assert list(
+            aws_mod.AWS.yield_cloud_specific_failover_overrides(
+                region='us-east-1')) == [{
+                    'vpc_name': 'primary-vpc'
+                }, {
+                    'vpc_name': 'secondary-vpc'
+                }]
+        assert list(
+            aws_mod.AWS.yield_cloud_specific_failover_overrides(
+                region='us-east-1')) == [{
+                    'vpc_name': 'primary-vpc'
+                }]
+        assert mock_resource.call_count == 2
+
+    @mock.patch.object(aws_mod.skypilot_config,
+                       'get_effective_region_config',
+                       return_value=['primary-vpc', 'secondary-vpc'])
+    @mock.patch.object(aws_mod, 'aws')
+    def test_caches_vpc_discovery_within_request(self, mock_aws, _):
+        ec2 = mock_aws.resource.return_value
+        ec2.vpcs.filter.return_value = [mock.Mock()]
+
+        list(
+            aws_mod.AWS.yield_cloud_specific_failover_overrides(
+                region='us-east-1'))
+        list(
+            aws_mod.AWS.yield_cloud_specific_failover_overrides(
+                region='us-east-1'))
+
+        mock_aws.resource.assert_called_once_with('ec2',
+                                                  region_name='us-east-1')
+
+
 class TestGetImageRootDeviceName:
 
     @pytest.fixture(autouse=True)
@@ -341,6 +491,7 @@ class TestEfaHelpers:
     def test_is_efa_instance_type(self):
         # True for EFA families
         assert aws_mod._is_efa_instance_type('g6.12xlarge') is True
+        assert aws_mod._is_efa_instance_type('g7e.12xlarge') is True
         assert aws_mod._is_efa_instance_type('p5.48xlarge') is True
         assert aws_mod._is_efa_instance_type('p6-b200.24xlarge') is True
         # False for non-EFA families
@@ -802,3 +953,39 @@ class TestAwsConfigFileEnvVar:
         assert mounts == {
             aws_mod._DEFAULT_AWS_CONFIG_PATH: str(credential_file)
         }
+
+
+class TestGetDefaultAmi:
+    """Tests for AWS._get_default_ami GPU image selection."""
+
+    def _patch(self, monkeypatch, acc, arch):
+        # Echo the requested tag back so we can assert which image was chosen.
+        monkeypatch.setattr(aws_mod.catalog, 'get_image_id_from_tag',
+                            lambda tag, region, clouds: tag)
+        monkeypatch.setattr(aws_mod.AWS, 'get_accelerators_from_instance_type',
+                            classmethod(lambda cls, instance_type: acc))
+        monkeypatch.setattr(aws_mod.AWS, 'get_arch_from_instance_type',
+                            classmethod(lambda cls, instance_type: arch))
+
+    def test_turing_gpu_uses_cuda13_default(self, monkeypatch):
+        self._patch(monkeypatch, {'T4': 1}, 'x86_64')
+        result = aws_mod.AWS._get_default_ami('us-east-1', 'g4dn.xlarge')
+        assert result == aws_mod._DEFAULT_GPU_IMAGE_ID
+
+    @pytest.mark.parametrize('acc_name', ['V100', 'M60'])
+    def test_pre_turing_gpu_uses_legacy_cuda12(self, monkeypatch, acc_name):
+        self._patch(monkeypatch, {acc_name: 1}, 'x86_64')
+        result = aws_mod.AWS._get_default_ami('us-east-1', 'p3.2xlarge')
+        assert result == aws_mod._DEFAULT_GPU_CUDA12_IMAGE_ID
+
+    def test_k80_uses_k80_image(self, monkeypatch):
+        self._patch(monkeypatch, {'K80': 1}, 'x86_64')
+        result = aws_mod.AWS._get_default_ami('us-east-1', 'p2.xlarge')
+        assert result == aws_mod._DEFAULT_GPU_K80_IMAGE_ID
+
+    def test_arm64_gpu_uses_cuda13_arm64(self, monkeypatch):
+        # All arm64 GPUs (e.g. GH200) are Turing+, so they use the default
+        # cuda13 arm64 image.
+        self._patch(monkeypatch, {'GH200': 1}, 'arm64')
+        result = aws_mod.AWS._get_default_ami('us-east-1', 'g5g.xlarge')
+        assert result == aws_mod._DEFAULT_GPU_ARM64_IMAGE_ID

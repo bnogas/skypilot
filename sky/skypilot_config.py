@@ -50,16 +50,20 @@ then:
 """
 import contextlib
 import copy
+import errno
+import hashlib
+import itertools
 import json
 import os
 import pathlib
 import re
 import tempfile
 import threading
+import time
 import typing
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import (Any, Callable, Dict, Iterator, List, Literal, Optional,
+                    Tuple, Union)
 
-import filelock
 import sqlalchemy
 from sqlalchemy import orm
 from sqlalchemy.dialects import postgresql
@@ -82,6 +86,8 @@ from sky.utils.kubernetes import config_map_utils
 
 if typing.TYPE_CHECKING:
     import yaml
+
+    from sky import models
 else:
     yaml = adaptors_common.LazyImport('yaml')
 
@@ -133,6 +139,7 @@ config_yaml_table = sqlalchemy.Table(
 
 
 class ConfigContext:
+    """The loaded config for one request context (or the process)."""
 
     def __init__(self,
                  config: config_utils.Config = config_utils.Config(),
@@ -141,6 +148,13 @@ class ConfigContext:
         self.config = config
         self.config_path = config_path
         self.config_overridden = config_overridden
+        # While a request overrides the config: the server's own config, before
+        # the client's layer was merged in. Settings the client must not
+        # weaken are read from here.
+        self.server_config: Optional[config_utils.Config] = None
+        # Generation of the server config cache entry `config` came from,
+        # see `_swap_in_server_config`.
+        self.loaded_generation = 0
 
 
 # The global loaded config.
@@ -155,6 +169,65 @@ def get_skypilot_config_lock_path() -> str:
     lock_path = os.path.expanduser(SKYPILOT_CONFIG_LOCK_PATH)
     os.makedirs(os.path.dirname(lock_path), exist_ok=True)
     return lock_path
+
+
+# Distributed lock id guarding config-file reads/writes.
+# A Postgres advisory lock if PG is available, falling back to a file
+# lock locally). All config-file writers/readers MUST use this same id.
+# Writers take it exclusively; pure reads (reloads) take it shared, so reads
+# don't serialize against each other but still block against a mid-write writer.
+SKYPILOT_CONFIG_LOCK_ID = 'skypilot-config-file'
+
+# Bounded wait for `safe_reload_config` (a read): long enough to ride out a
+# writer holding the lock, short enough not to hang the caller behind a wedged
+# holder. On timeout the reload is skipped and the current config is kept.
+_CONFIG_RELOAD_LOCK_TIMEOUT_SECONDS = 20
+
+# Tries at reading the file named by ENV_VAR_SKYPILOT_CONFIG when it is
+# missing or its handle is stale (see _reload_config_from_internal_file).
+# About 10 seconds in all with the backoff below: each wait is capped at 2
+# seconds before Backoff's +/-40% jitter, so a wait can reach 2.8 seconds and
+# the total up to about 14. On a busy shared filesystem a stale handle can
+# outlast a couple of seconds.
+_INTERNAL_CONFIG_READ_ATTEMPTS = 9
+_INTERNAL_CONFIG_READ_INITIAL_BACKOFF_SECONDS = 0.25
+_INTERNAL_CONFIG_READ_MAX_BACKOFF_FACTOR = 8
+
+# How often a contended acquirer retries the config lock. The Postgres lock
+# acquires via `pg_try_advisory_lock` polled every `poll_interval` seconds; its
+# default (1s) means a waiter can sleep up to ~1s after the holder releases
+# before noticing. The config lock is held only for a fast reload/RMW (a file
+# read + a single-row DB query, ~ms) but sits on hot paths (every sync-handler
+# config refresh, login-time reconcile, config write), so poll at 100ms to keep
+# contended latency ~10x lower. Still far above a DB-storming rate for the few
+# waiters this lock ever sees.
+_CONFIG_LOCK_POLL_INTERVAL_SECONDS = 0.1
+
+
+def get_skypilot_config_lock(timeout: Optional[float] = None,
+                             shared_lock: bool = False):
+    """Return the distributed lock guarding the config file.
+
+    ``timeout=None`` waits indefinitely (matches the historical file-lock
+    behavior); callers that must not block forever pass a timeout and handle
+    ``locks.LockTimeout``.
+
+    ``shared_lock=True`` acquires a *shared* (read) advisory lock instead of the
+    default *exclusive* (write) lock. Concurrent shared holders don't block each
+    other, but a shared holder still blocks against an exclusive writer (and
+    vice versa) for torn-read safety. Use it for pure config *reads* (reloads);
+    read-modify-write callers MUST keep the exclusive lock. Only the Postgres
+    backend distinguishes the two modes — the filelock fallback is always
+    exclusive (acceptable at local/low concurrency).
+    """
+    # Lazy import: sky.utils.locks -> global_user_state -> skypilot_config, so a
+    # top-level import here would be circular. Imported at call time (after all
+    # modules are loaded) it is safe.
+    from sky.utils import locks  # pylint: disable=import-outside-toplevel
+    return locks.get_lock(SKYPILOT_CONFIG_LOCK_ID,
+                          timeout,
+                          poll_interval=_CONFIG_LOCK_POLL_INTERVAL_SECONDS,
+                          shared_lock=shared_lock)
 
 
 def _get_config_context() -> ConfigContext:
@@ -173,6 +246,8 @@ def _get_config_context() -> ConfigContext:
             config_path=_global_config_context.config_path,
             config_overridden=_global_config_context.config_overridden,
         )
+        ctx.config_context.loaded_generation = (
+            _global_config_context.loaded_generation)
     return ctx.config_context
 
 
@@ -197,7 +272,12 @@ def _get_loaded_config_path() -> List[Optional[str]]:
 def _set_loaded_config_path(
         path: Optional[Union[str, List[Optional[str]]]]) -> None:
     if not path:
+        # Store the empty case as None rather than the serialized string
+        # 'null': the latter travels to the API server on every request that
+        # carries a config override, where json.loads() turns it back into
+        # None instead of a list.
         _get_config_context().config_path = None
+        return
     if isinstance(path, str):
         path = [path]
     _get_config_context().config_path = json.dumps(path)
@@ -363,6 +443,40 @@ def get_effective_workspace_region_config(
                                        override_configs)
 
 
+def get_server_workspace_region_config(cloud: str,
+                                       keys: Tuple[str, ...],
+                                       region: Optional[str] = None,
+                                       default_value: Optional[Any] = None,
+                                       workspace: Optional[str] = None) -> Any:
+    """Like get_effective_workspace_region_config, from server layers only.
+
+    Ignores the client config a request merged in and any task override, so a
+    setting an administrator made cannot be undone by the requester.
+    """
+    ctx = _get_config_context()
+    config = (ctx.server_config
+              if ctx.server_config is not None else ctx.config)
+    if workspace is None:
+        workspace = get_active_workspace()
+    workspace_config = config.get_nested(keys=('workspaces', workspace),
+                                         default_value=None)
+    if workspace_config is not None:
+        value = config_utils.get_cloud_config_value_from_dict(
+            dict_config=workspace_config,
+            cloud=cloud,
+            keys=keys,
+            region=region,
+            default_value=None)
+        if value is not None:
+            return value
+    return config_utils.get_cloud_config_value_from_dict(
+        dict_config=config,
+        cloud=cloud,
+        keys=keys,
+        region=region,
+        default_value=default_value)
+
+
 def get_effective_region_config(cloud: str,
                                 keys: Tuple[str, ...],
                                 region: Optional[str] = None,
@@ -392,22 +506,102 @@ def get_effective_region_config(cloud: str,
         merge_dicts=merge_dicts)
 
 
+def _loaded_workspaces() -> Dict[str, Any]:
+    """The loaded `workspaces:` section, not copied (`get_nested` deep-copies
+    the whole config): name lookups run per record and only read it."""
+    workspaces = _get_loaded_config().get('workspaces')
+    return workspaces if isinstance(workspaces, dict) else {}
+
+
+def get_workspace_name(workspace_id: str,
+                       workspaces: Optional[Dict[str, Any]] = None) -> str:
+    """Returns the user-facing name of the workspace with this id.
+
+    A workspace's key in `workspaces:` is its immutable id; its `name` field is
+    what users see and type, and defaults to the id. The default workspace is
+    always named 'default', whatever is stored.
+    """
+    if workspace_id == constants.SKYPILOT_DEFAULT_WORKSPACE:
+        return workspace_id
+    if workspaces is None:
+        workspaces = _loaded_workspaces()
+    workspace_config = workspaces.get(workspace_id)
+    if isinstance(workspace_config, dict) and workspace_config.get('name'):
+        return workspace_config['name']
+    return workspace_id
+
+
+def workspace_label(workspace_id: str,
+                    workspaces: Optional[Dict[str, Any]] = None) -> str:
+    """`'name' (id)` for logs and audit records; `'id'` when they match.
+
+    Names change and ids do not, so a record carries both.
+    """
+    name = get_workspace_name(workspace_id, workspaces)
+    if name == workspace_id:
+        return repr(workspace_id)
+    return f'{name!r} ({workspace_id})'
+
+
+def resolve_workspace_ref(ref: str,
+                          workspaces: Optional[Dict[str, Any]] = None) -> str:
+    """Maps a workspace reference (an id or a name) to its id.
+
+    An id wins: a name may not equal another workspace's id and a legacy id
+    stays taken after a rename, so a stored id never names another workspace
+    (barring a hand-edited config). Otherwise the ref is matched by name. An
+    unmatched ref is returned unchanged, so an unknown one fails where it is
+    checked.
+    """
+    if workspaces is None:
+        workspaces = _loaded_workspaces()
+    if ref == constants.SKYPILOT_DEFAULT_WORKSPACE or ref in workspaces:
+        return ref
+    matches = [
+        workspace_id for workspace_id in set(workspaces) |
+        {constants.SKYPILOT_DEFAULT_WORKSPACE}
+        if get_workspace_name(workspace_id, workspaces) == ref
+    ]
+    if len(matches) > 1:
+        raise ValueError(f'More than one workspace is named {ref!r}. Ask an '
+                         'administrator to rename one of them.')
+    return matches[0] if matches else ref
+
+
 def get_workspace_cloud(cloud: str,
                         workspace: Optional[str] = None) -> config_utils.Config:
-    """Returns the workspace config."""
-    # TODO(zhwu): Instead of just returning the workspace specific config, we
-    # should return the config that already merges the global config, so that
-    # the caller does not need to manually merge the global config with
-    # the workspace specific config.
+    """Returns the workspace cloud config, deep-merged with global cloud config.
+
+    Workspace-specific values override global values. Fields not set in the
+    workspace block are inherited from the global cloud config. This allows
+    workspaces to override only the fields they need (e.g., namespace)
+    without losing other global settings (e.g., allowed_contexts).
+    """
     if workspace is None:
         workspace = get_active_workspace()
-    clouds = get_nested(keys=(
+
+    # Get workspace-specific cloud overrides
+    workspace_clouds = get_nested(keys=(
         'workspaces',
         workspace,
-    ), default_value=None)
-    if clouds is None:
-        return config_utils.Config()
-    return clouds.get(cloud.lower(), config_utils.Config())
+    ),
+                                  default_value=None)
+    workspace_cloud = None
+    if isinstance(workspace_clouds, dict):
+        ws = workspace_clouds.get(cloud.lower())
+        if isinstance(ws, dict):
+            workspace_cloud = ws
+
+    # Deep-merge workspace cloud config on top of global cloud config.
+    # get_nested internally does deepcopy + _recursive_update.
+    merged = _get_loaded_config().get_nested(
+        keys=(cloud.lower(),),
+        default_value=config_utils.Config(),
+        override_configs={cloud.lower(): workspace_cloud}
+        if workspace_cloud else None)
+    if isinstance(merged, dict):
+        return config_utils.Config(merged)
+    return config_utils.Config()
 
 
 @contextlib.contextmanager
@@ -429,16 +623,44 @@ def local_active_workspace_ctx(workspace: str) -> Iterator[None]:
     Raises:
         RuntimeError: If called from a non-main thread.
     """
-    original_workspace = get_active_workspace()
-    if original_workspace == workspace:
+    if get_active_workspace() == workspace:
         # No change, do nothing.
         yield
         return
+    # Capture whether the thread-local attribute was set, NOT the
+    # resolved active_workspace string. The two differ when nothing was
+    # set previously: `get_active_workspace()` falls back to the literal
+    # SKYPILOT_DEFAULT_WORKSPACE ('default'), and unconditionally
+    # restoring to that string would leave the attribute SET to 'default'
+    # — making `is_active_workspace_set()` return True for the next
+    # request handled by the same worker process, which causes the
+    # workspace resolver gate to silently skip and fall back to the
+    # literal 'default' (broken for users without 'default' access).
+    had_workspace = hasattr(_active_workspace_context, 'workspace')
+    prior_value: Optional[str] = None
+    if had_workspace:
+        prior_value = _active_workspace_context.workspace
     _active_workspace_context.workspace = workspace
     logger.debug(f'Set context workspace: {workspace}')
-    yield
-    logger.debug(f'Reset context workspace: {original_workspace}')
-    _active_workspace_context.workspace = original_workspace
+    # try/finally is required: a caller that lets an exception escape the
+    # `with` block would otherwise leak this thread-local workspace to
+    # subsequent callers in the same worker process (ProcessPoolExecutor
+    # reuses workers). For most callers the leak is masked because
+    # `override_skypilot_config` resets the current thread's workspace per
+    # request, but tightening this here is the right shape for a
+    # contextmanager and removes the implicit dependency on that reset.
+    try:
+        yield
+    finally:
+        if had_workspace:
+            logger.debug(f'Reset context workspace: {prior_value}')
+            _active_workspace_context.workspace = prior_value
+        else:
+            logger.debug('Reset context workspace: <unset>')
+            try:
+                del _active_workspace_context.workspace
+            except AttributeError:
+                pass
 
 
 def get_active_workspace(force_user_workspace: bool = False) -> str:
@@ -453,8 +675,29 @@ def get_active_workspace(force_user_workspace: bool = False) -> str:
                      f'{constants.SKYPILOT_DEFAULT_WORKSPACE}')
         active_workspace = constants.SKYPILOT_DEFAULT_WORKSPACE
     else:
+        # Outside a request (e.g. a handler in the main process) this is the
+        # server config's own value, which an admin may write as a name.
+        active_workspace = _resolve_server_active_workspace(active_workspace)
         logger.debug(f'Got active workspace: {active_workspace}')
     return active_workspace
+
+
+def is_active_workspace_set() -> bool:
+    """Returns True iff active_workspace was explicitly set somewhere.
+
+    Distinguishes "user set active_workspace" from "fell back to the
+    SKYPILOT_DEFAULT_WORKSPACE literal because nothing was set". The two are
+    indistinguishable through `get_active_workspace()` (both return a string)
+    but are different on the wire: the override config sent by the client
+    omits the key entirely when unset. The server-side per-user resolver
+    should only kick in for the unset case — explicit intent (including
+    explicit `'default'`) is respected as-is.
+    """
+    context_workspace = getattr(_active_workspace_context, 'workspace', None)
+    if context_workspace is not None:
+        return True
+    return get_nested(keys=('active_workspace',),
+                      default_value=None) is not None
 
 
 def set_nested(keys: Tuple[str, ...], value: Any) -> Dict[str, Any]:
@@ -468,8 +711,27 @@ def set_nested(keys: Tuple[str, ...], value: Any) -> Dict[str, Any]:
 
 
 def to_dict() -> config_utils.Config:
-    """Returns a deep-copied version of the current config."""
+    """Returns a deep-copied version of the current config.
+
+    `active_workspace` here is only what the config itself sets; use
+    `resolved_config()` for the workspace the request actually runs in.
+    """
     return copy.deepcopy(_get_loaded_config())
+
+
+def resolved_config() -> config_utils.Config:
+    """Returns the config with the effective `active_workspace` filled in.
+
+    The active workspace can be resolved into a thread-local context instead
+    of the config (the server-side resolver in
+    `executor.override_request_env_and_config` sets it there), so
+    `active_workspace` is taken from `get_active_workspace()`. Callers that
+    need the workspace a request actually runs in — e.g. admin policies —
+    should use this rather than `to_dict()`.
+    """
+    config = to_dict()
+    config['active_workspace'] = get_active_workspace()
+    return config
 
 
 def _get_config_file_path(envvar: str) -> Optional[str]:
@@ -491,9 +753,27 @@ def _validate_config(config: Dict[str, Any], config_source: str) -> None:
     _validate_dashboard_external_links(config, config_source)
 
 
+# Variables that may appear as ${var} inside a dashboard.external_links url
+# template. Substitution happens client-side in the dashboard; keep in sync
+# with TEMPLATE_LINK_VARIABLES in
+# sky/dashboard/src/utils/externalLinks.js.
+DASHBOARD_LINK_TEMPLATE_VARIABLES = frozenset({
+    'cluster_name',
+    'job_id',
+    'job_name',
+    'user',
+    'workspace',
+})
+_TEMPLATE_VARIABLE_PATTERN = re.compile(r'\$\{([^}]*)\}')
+
+
 def _validate_dashboard_external_links(config: Dict[str, Any],
                                        config_source: str) -> None:
-    """Ensures every dashboard.external_links regex is compilable."""
+    """Ensures every dashboard.external_links entry is well-formed.
+
+    `regex` entries must compile; `url` entries may only reference known
+    template variables.
+    """
     dashboard = config.get('dashboard') if isinstance(config, dict) else None
     if not isinstance(dashboard, dict):
         return
@@ -504,15 +784,26 @@ def _validate_dashboard_external_links(config: Dict[str, Any],
         if not isinstance(entry, dict):
             continue
         regex = entry.get('regex')
-        if not isinstance(regex, str):
-            continue
-        try:
-            re.compile(regex)
-        except re.error as e:
-            raise ValueError(
-                f'Invalid config YAML from ({config_source}). '
-                f'dashboard.external_links[{idx}].regex is not a valid regex: '
-                f'{regex!r} ({e}).') from e
+        if isinstance(regex, str):
+            try:
+                re.compile(regex)
+            except re.error as e:
+                raise ValueError(
+                    f'Invalid config YAML from ({config_source}). '
+                    f'dashboard.external_links[{idx}].regex is not a valid '
+                    f'regex: {regex!r} ({e}).') from e
+        url = entry.get('url')
+        if isinstance(url, str):
+            for match in _TEMPLATE_VARIABLE_PATTERN.finditer(url):
+                variable = match.group(1)
+                if variable not in DASHBOARD_LINK_TEMPLATE_VARIABLES:
+                    allowed = ', '.join(
+                        sorted(DASHBOARD_LINK_TEMPLATE_VARIABLES))
+                    raise ValueError(
+                        f'Invalid config YAML from ({config_source}). '
+                        f'dashboard.external_links[{idx}].url references an '
+                        f'unknown template variable '
+                        f'${{{variable}}}. Allowed variables: {allowed}.')
 
 
 def overlay_skypilot_config(
@@ -530,13 +821,54 @@ def overlay_skypilot_config(
 
 
 def safe_reload_config() -> None:
-    """Reloads the config, safe to be called concurrently."""
-    with filelock.FileLock(get_skypilot_config_lock_path()):
-        reload_config()
+    """Reloads the config, safe to be called concurrently.
+
+    Best-effort refresh with a bounded lock wait: a reload is a *read*, so on a
+    lock timeout we log and proceed with the currently loaded config rather than
+    block the caller indefinitely behind a wedged lock holder (the historical
+    ``timeout=None`` could hang every reloader across processes forever).
+
+    In server mode, a config whose source is unchanged since the last load is
+    reused without taking the lock, so it does not wait behind a writer.
+    Otherwise it uses a *shared* lock so concurrent reloads (this is a hot
+    path: every sync-handler config refresh, login-time role seed, periodic
+    reconcile) don't serialize against each other; a writer's exclusive lock
+    blocks these reloads mid-write. Safe against concurrent reloads
+    within a single process because `reload_config` swaps the new config in
+    atomically (no transient empty-config window).
+    """
+    # Lazy import to avoid the sky.utils.locks -> global_user_state ->
+    # skypilot_config import cycle (see get_skypilot_config_lock).
+    from sky.utils import locks  # pylint: disable=import-outside-toplevel
+
+    # No lock is needed to reuse the cached config: a file read mid-write
+    # hashes differently from the cached one and falls through to the lock.
+    if (_config_mode()[0] == 'server' and
+            _reload_config_as_server(cached_only=True)):
+        return
+    try:
+        with get_skypilot_config_lock(_CONFIG_RELOAD_LOCK_TIMEOUT_SECONDS,
+                                      shared_lock=True):
+            reload_config()
+    except locks.LockTimeout:
+        logger.warning(
+            'Timed out acquiring the config lock to reload; proceeding with '
+            'the currently loaded config.')
+
+
+def _config_mode() -> Tuple[str, Optional[str]]:
+    """Where reload_config() loads from: 'internal' (with the file's path),
+    'server' or 'client'."""
+    internal_config_path = os.environ.get(ENV_VAR_SKYPILOT_CONFIG)
+    if internal_config_path is not None:
+        return 'internal', internal_config_path
+    if os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is not None:
+        return 'server', None
+    return 'client', None
 
 
 def reload_config() -> None:
-    internal_config_path = os.environ.get(ENV_VAR_SKYPILOT_CONFIG)
+    mode, internal_config_path = _config_mode()
     if internal_config_path is not None:
         # {ENV_VAR_SKYPILOT_CONFIG} is used internally.
         # When this environment variable is set, the config loading
@@ -544,18 +876,25 @@ def reload_config() -> None:
         # SkyPilot reserves the right to change the config loading behavior
         # at any time when this environment variable is set.
         _reload_config_from_internal_file(internal_config_path)
-        return
-
-    if os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is not None:
+    elif mode == 'server':
         _reload_config_as_server()
     else:
         _reload_config_as_client()
 
 
 def parse_and_validate_config_file(config_path: str) -> config_utils.Config:
+    with open(config_path, 'rb') as f:
+        return _parse_and_validate_config(config_path, f.read())[0]
+
+
+def _parse_and_validate_config(
+        config_path: str,
+        content: bytes) -> Tuple[config_utils.Config, Optional[str]]:
+    """Parses a config file's bytes. Returns the config and its `db` URL."""
     config = config_utils.Config()
+    db_url = None
     try:
-        config_dict = yaml_utils.read_yaml(config_path)
+        config_dict = yaml_utils.safe_load(content.decode('utf-8'))
         config = config_utils.Config.from_dict(config_dict)
         # pop the db url from the config, and set it to the env var.
         # this is to avoid db url (considered a sensitive value)
@@ -563,16 +902,16 @@ def parse_and_validate_config_file(config_path: str) -> config_utils.Config:
         db_url = config.pop_nested(('db',), None)
         if db_url:
             os.environ[constants.ENV_VAR_DB_CONNECTION_URI] = db_url
-        if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+        if sky_logging.will_log(logger, sky_logging.DEBUG):
             logger.debug(f'Config loaded from {config_path}:\n'
-                         f'{yaml_utils.dump_yaml_str(dict(config))}')
+                         f'{config_utils.dump_redacted_yaml(config)}')
     except yaml.YAMLError as e:
         logger.error(f'Error in loading config file ({config_path}):', e)
     if config:
         _validate_config(config, config_path)
 
     logger.debug(f'Config syntax check passed for path: {config_path}')
-    return config
+    return config, db_url or None
 
 
 def _parse_dotlist(dotlist: List[str]) -> config_utils.Config:
@@ -600,21 +939,62 @@ def _parse_dotlist(dotlist: List[str]) -> config_utils.Config:
     return config
 
 
-def _reload_config_from_internal_file(internal_config_path: str) -> None:
-    # Reset the global variables, to avoid using stale values.
-    _set_loaded_config(config_utils.Config())
-    _set_loaded_config_path(None)
-
-    config_path = os.path.expanduser(internal_config_path)
+def _read_internal_config_file(
+        config_path: str) -> Optional[config_utils.Config]:
+    """Read the internal config file, or None if it does not exist."""
     if not os.path.exists(config_path):
-        with ux_utils.print_exception_no_traceback():
-            raise FileNotFoundError(
-                'Config file specified by env var '
-                f'{ENV_VAR_SKYPILOT_CONFIG} ({config_path!r}) does not '
-                'exist. Please double check the path or unset the env var: '
-                f'unset {ENV_VAR_SKYPILOT_CONFIG}')
+        return None
     logger.debug(f'Using config path: {config_path}')
-    _set_loaded_config(parse_and_validate_config_file(config_path))
+    return parse_and_validate_config_file(config_path)
+
+
+def _is_transient_file_error(e: OSError) -> bool:
+    return isinstance(e, FileNotFoundError) or e.errno == errno.ESTALE
+
+
+def _reload_config_from_internal_file(internal_config_path: str) -> None:
+    # Build the new config fully, then swap it in at the end (see
+    # `_reload_config_as_server` for why we don't blank up front). A missing
+    # file raises with the previously-loaded config left intact.
+    #
+    # The API server reads this file while setting up each request. When
+    # several API server replicas share the file's filesystem (e.g. NFS),
+    # another replica replacing the file can briefly make it missing here, or
+    # leave this client holding a stale handle to the old file (ESTALE). Both
+    # pass on a retry; failing would fail the request before it even starts.
+    config_path = os.path.expanduser(internal_config_path)
+    backoff = common_utils.Backoff(
+        _INTERNAL_CONFIG_READ_INITIAL_BACKOFF_SECONDS,
+        _INTERNAL_CONFIG_READ_MAX_BACKOFF_FACTOR)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            config = _read_internal_config_file(config_path)
+        except OSError as e:
+            if (attempt >= _INTERNAL_CONFIG_READ_ATTEMPTS or
+                    not _is_transient_file_error(e)):
+                raise
+            logger.debug(f'Failed to read config file {config_path!r}; '
+                         f'retrying: {e}')
+        else:
+            if config is not None:
+                break
+            if attempt >= _INTERNAL_CONFIG_READ_ATTEMPTS:
+                # Only for the final error: this context leaves
+                # sys.tracebacklimit at 0 when the exception escapes it (so
+                # the error prints without a traceback), which a retried miss
+                # must not do to the rest of the process.
+                with ux_utils.print_exception_no_traceback():
+                    raise FileNotFoundError(
+                        'Config file specified by env var '
+                        f'{ENV_VAR_SKYPILOT_CONFIG} ({config_path!r}) does '
+                        'not exist. Please double check the path or unset the '
+                        f'env var: unset {ENV_VAR_SKYPILOT_CONFIG}')
+            logger.debug(f'Config file {config_path!r} does not exist; '
+                         'retrying.')
+        time.sleep(backoff.current_backoff())
+    _set_loaded_config(config)
     _set_loaded_config_path(config_path)
 
 
@@ -630,49 +1010,125 @@ def _create_table(engine: sqlalchemy.engine.Engine):
 _db_manager = db_utils.DatabaseManager(db_name='config',
                                        create_table_fn=_create_table)
 
+# The last server config load: (fingerprint, config, db URL popped from the
+# file, generation). Replaced by one assignment, so a lock-free reader never
+# pairs a new fingerprint with an old config.
+_server_config_cache: Optional[Tuple[Tuple[Optional[str], Optional[str],
+                                           Optional[str], Optional[str], bool],
+                                     config_utils.Config, Optional[str],
+                                     int]] = None
+# Numbers cache entries in the order they are published. A full load that
+# holds the config lock reads and publishes with writers locked out, so a later
+# entry holds data at least as new. A load without it can publish older data
+# under a later number; the next reload replaces that entry, whose fingerprint
+# no longer matches the sources.
+_server_config_generations = itertools.count(1)
+_server_config_swap_lock = threading.Lock()
 
-def _reload_config_as_server() -> None:
-    # Reset the global variables, to avoid using stale values.
-    _set_loaded_config(config_utils.Config())
-    _set_loaded_config_path(None)
 
+def _read_config_yaml_value() -> Optional[str]:
+    with orm.Session(_db_manager.get_engine()) as session:
+        row = session.query(config_yaml_table).filter_by(
+            key=API_SERVER_CONFIG_KEY).first()
+    return row.value if row else None
+
+
+def _swap_in_server_config(generation: int, config: config_utils.Config,
+                           path: Optional[str]) -> None:
+    """Sets the loaded config unless this context holds a later cache entry's.
+
+    The reuse path reads its sources without the config lock, so a writer can
+    commit and another load swap in the new config before this one swaps.
+    The caller holds `_server_config_swap_lock`.
+    """
+    config_context = _get_config_context()
+    if generation >= config_context.loaded_generation:
+        config_context.config = config
+        _set_loaded_config_path(path)
+        config_context.loaded_generation = generation
+
+
+def _reload_config_as_server(cached_only: bool = False) -> bool:
+    """Loads the server config, reusing the last load if its source is
+    unchanged. With `cached_only`, only that reuse is tried.
+
+    Returns:
+        Whether the config was loaded.
+    """
+    global _server_config_cache
+    # Build the new config fully, then swap it in with a single
+    # `_set_loaded_config` at the end. Do NOT blank the loaded config up front:
+    # `get_nested` reads without the config lock (hot path), so a transient
+    # empty config would be observable by a concurrent reader and e.g. make
+    # `rbac.get_default_role()` fall back to admin. On any exception below the
+    # previously-loaded config is left in place (stale is safer than empty).
     server_config_path = _resolve_server_config_path()
-    server_config = _get_config_from_path(server_config_path)
-    # Get the db url from the env var. _get_config_from_path should have moved
-    # the db url specified in config file to the env var.
-    db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+    # Validation turns strict once plugins load, so a parse from before then
+    # must not be reused after.
+    strict = not schemas._allow_additional_properties()  # pylint: disable=protected-access
+    content = None
+    file_hash = None
+    if server_config_path is not None:
+        with open(server_config_path, 'rb') as f:
+            content = f.read()
+        file_hash = hashlib.sha256(content).hexdigest()
 
+    cache = _server_config_cache
+    if cache is not None and cache[0][:2] == (server_config_path, file_hash):
+        fingerprint, cached_config, file_db_url, generation = cache
+        if file_db_url:
+            # Executors restore os.environ after each request, which can drop
+            # the URL the first parse of this file set.
+            os.environ[constants.ENV_VAR_DB_CONNECTION_URI] = file_db_url
+        db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+        db_value = _read_config_yaml_value() if db_url else None
+        if (server_config_path, file_hash, db_url, db_value,
+                strict) == fingerprint:
+            config = copy.deepcopy(cached_config)
+            with _server_config_swap_lock:
+                _swap_in_server_config(generation, config, server_config_path)
+            return True
+    if cached_only:
+        return False
+
+    server_config = config_utils.Config()
+    file_db_url = None
+    if server_config_path is not None:
+        assert content is not None
+        server_config, file_db_url = _parse_and_validate_config(
+            server_config_path, content)
+    # The parse above moved a db url specified in the config file to the env
+    # var.
+    db_url = os.environ.get(constants.ENV_VAR_DB_CONNECTION_URI)
+    db_value = None
     if db_url:
         if len(server_config.keys()) > 1:
             raise ValueError(
                 'If db config is specified, no other config is allowed')
         logger.debug('retrieving config from database')
-
-        def _get_config_yaml_from_db(key: str) -> Optional[config_utils.Config]:
-            with orm.Session(_db_manager.get_engine()) as session:
-                row = session.query(config_yaml_table).filter_by(
-                    key=key).first()
-            if row:
-                db_config = config_utils.Config(yaml_utils.safe_load(row.value))
-                db_config.pop_nested(('db',), None)
-                return db_config
-            return None
-
-        db_config = _get_config_yaml_from_db(API_SERVER_CONFIG_KEY)
-        if db_config:
-            server_config = overlay_skypilot_config(server_config, db_config)
-    if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+        db_value = _read_config_yaml_value()
+        if db_value is not None:
+            db_config = config_utils.Config(yaml_utils.safe_load(db_value))
+            db_config.pop_nested(('db',), None)
+            if db_config:
+                server_config = overlay_skypilot_config(server_config,
+                                                        db_config)
+    if sky_logging.will_log(logger, sky_logging.DEBUG):
         logger.debug(f'server config: \n'
-                     f'{yaml_utils.dump_yaml_str(dict(server_config))}')
-    _set_loaded_config(server_config)
-    _set_loaded_config_path(server_config_path)
+                     f'{config_utils.dump_redacted_yaml(server_config)}')
+    config = copy.deepcopy(server_config)
+    with _server_config_swap_lock:
+        generation = next(_server_config_generations)
+        _server_config_cache = ((server_config_path, file_hash, db_url,
+                                 db_value, strict), server_config, file_db_url,
+                                generation)
+        _swap_in_server_config(generation, config, server_config_path)
+    return True
 
 
 def _reload_config_as_client() -> None:
-    # Reset the global variables, to avoid using stale values.
-    _set_loaded_config(config_utils.Config())
-    _set_loaded_config_path(None)
-
+    # Build the new config fully, then swap it in at the end (see
+    # `_reload_config_as_server` for why we don't blank up front).
     overrides: List[config_utils.Config] = []
     user_config_path = resolve_user_config_path()
     user_config = _get_config_from_path(user_config_path)
@@ -688,10 +1144,10 @@ def _reload_config_as_client() -> None:
     for override in overrides:
         overlaid_client_config = overlay_skypilot_config(
             original_config=overlaid_client_config, override_configs=override)
-    if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+    if sky_logging.will_log(logger, sky_logging.DEBUG):
         logger.debug(
             f'client config (before task and CLI overrides): \n'
-            f'{yaml_utils.dump_yaml_str(dict(overlaid_client_config))}')
+            f'{config_utils.dump_redacted_yaml(overlaid_client_config)}')
     _set_loaded_config(overlaid_client_config)
     _set_loaded_config_path([user_config_path, project_config_path])
 
@@ -724,28 +1180,76 @@ def loaded() -> bool:
     return bool(_get_loaded_config())
 
 
+def _resolve_server_active_workspace(ref: str,
+                                     workspaces: Optional[Dict[str, Any]] = None
+                                    ) -> str:
+    """Resolves the server config's own `active_workspace`.
+
+    Only a hand-edited config can make the name ambiguous; failing every
+    request (internal daemons included) would be worse, so use it as an id.
+    """
+    try:
+        return resolve_workspace_ref(ref, workspaces)
+    except ValueError as e:
+        logger.warning(f'Using active_workspace {ref!r} from the server '
+                       f'config as an id: {e}')
+        return ref
+
+
 @contextlib.contextmanager
 def override_skypilot_config(
         override_configs: Optional[Dict[str, Any]],
-        override_config_path_serialized: Optional[str] = None
-) -> Iterator[None]:
-    """Overrides the user configurations."""
-    # TODO(SKY-1215): allow admin user to extend the disallowed keys or specify
+        override_config_path_serialized: Optional[str] = None,
+        *,
+        from_loopback: bool = True) -> Iterator[None]:
+    """Overrides the user configurations.
+
+    Args:
+        from_loopback: Whether the overrides come from a loopback client. The
+            default (True) layers every key, which is correct for the common
+            case of composing the user's own config (client-side, in-process,
+            a local server, or a controller). A caller that applies a REMOTE
+            client's config to the server -- i.e. handling an untrusted request
+            -- MUST pass the request's own from_loopback, so that on a remote
+            request the REMOTE_SKIPPED_CLIENT_OVERRIDE_KEYS are ignored too.
+            Keyword-only, so this is a deliberate choice at every such site.
+    """
+    # TODO: allow admin user to extend the disallowed keys or specify
     # allowed keys.
     if not override_configs:
-        # If no override configs (None or empty dict), do nothing.
-        yield
+        # The server's own `active_workspace` is typed by an admin; resolve it
+        # like a client's. Only the active workspace changes: the config keeps
+        # what the admin wrote (the config editor shows it).
+        server_workspace = get_nested(keys=('active_workspace',),
+                                      default_value=None)
+        if server_workspace is None:
+            yield
+            return
+        with local_active_workspace_ctx(
+                _resolve_server_active_workspace(server_workspace)):
+            yield
         return
     original_config = _get_loaded_config()
     original_config_path = loaded_config_path_serialized()
+    # Nested overrides keep the outermost server config.
+    outer_server_config = _get_config_context().server_config
     override_configs = config_utils.Config(override_configs)
     if override_config_path_serialized is None:
         override_config_path = []
     else:
+        # A client may serialize the absence of a config path as the JSON
+        # string 'null', which json.loads() turns into None. Normalize it the
+        # same way _get_loaded_config_path() does, so the value stays a list
+        # for the concatenation below.
         override_config_path = json.loads(override_config_path_serialized)
+        if override_config_path is None:
+            override_config_path = []
 
     disallowed_diff_keys = []
-    for key in constants.SKIPPED_CLIENT_OVERRIDE_KEYS:
+    skipped_keys = list(constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
+    if not from_loopback:
+        skipped_keys += constants.REMOTE_SKIPPED_CLIENT_OVERRIDE_KEYS
+    for key in skipped_keys:
         if key == ('db',):
             # since db key is popped out of server config, the key is expected
             # to be different between client and server.
@@ -754,6 +1258,19 @@ def override_skypilot_config(
         if (value is not None and
                 value != original_config.get_nested(key, default_value=None)):
             disallowed_diff_keys.append('.'.join(key))
+    # ssh_proxy_command becomes a server-side SSH ProxyCommand during
+    # provisioning, so it is a server-owned setting (like admin_policy): a
+    # client must not supply it per request. It lives under each cloud block,
+    # so strip it from every cloud override; set it in the server config.
+    for cloud_name in list(override_configs.keys()):
+        cloud_override = override_configs.get(cloud_name)
+        if (not isinstance(cloud_override, dict) or
+                'ssh_proxy_command' not in cloud_override):
+            continue
+        value = cloud_override.pop('ssh_proxy_command')
+        if value != original_config.get_nested(
+            (cloud_name, 'ssh_proxy_command'), default_value=None):
+            disallowed_diff_keys.append(f'{cloud_name}.ssh_proxy_command')
     # Only warn if there is a diff in disallowed override keys, as the client
     # use the same config file when connecting to a local server.
     if disallowed_diff_keys:
@@ -769,18 +1286,29 @@ def override_skypilot_config(
         override_configs=dict(override_configs),
         allowed_override_keys=None,
         disallowed_override_keys=constants.SKIPPED_CLIENT_OVERRIDE_KEYS)
-    workspace = config.get_nested(
-        keys=('active_workspace',),
-        default_value=constants.SKYPILOT_DEFAULT_WORKSPACE)
-    if (workspace != constants.SKYPILOT_DEFAULT_WORKSPACE and workspace
-            not in get_nested(keys=('workspaces',), default_value={})):
+    workspaces = get_nested(keys=('workspaces',), default_value={})
+    workspace = config.get_nested(keys=('active_workspace',),
+                                  default_value=None)
+    if workspace is not None:
+        if override_configs.get('active_workspace') is not None:
+            workspace = resolve_workspace_ref(workspace, workspaces)
+        else:
+            workspace = _resolve_server_active_workspace(workspace, workspaces)
+    if workspace is None:
+        workspace = constants.SKYPILOT_DEFAULT_WORKSPACE
+    else:
+        config.set_nested(('active_workspace',), workspace)
+    if (workspace != constants.SKYPILOT_DEFAULT_WORKSPACE and
+            workspace not in workspaces):
         raise ValueError(f'Workspace {workspace} does not exist. '
                          'Use `sky check` to see if it is defined on the API '
                          'server and try again.')
-    # Initialize the active workspace context to the workspace specified, so
-    # that a new request is not affected by the previous request's workspace.
-    global _active_workspace_context
-    _active_workspace_context = threading.local()
+    # Reset this thread's active workspace, so that a new request is not
+    # affected by the previous request's workspace. Do not rebind the
+    # module-level thread-local: other threads in this process (e.g. inline
+    # API server handlers) keep theirs.
+    if hasattr(_active_workspace_context, 'workspace'):
+        del _active_workspace_context.workspace
 
     try:
         common_utils.validate_schema(
@@ -791,6 +1319,9 @@ def override_skypilot_config(
             'Error: ',
             skip_none=False)
         _set_config_overridden(True)
+        _get_config_context().server_config = (outer_server_config
+                                               if outer_server_config
+                                               is not None else original_config)
         _set_loaded_config(config)
         _set_loaded_config_path(_get_loaded_config_path() +
                                 override_config_path)
@@ -801,14 +1332,37 @@ def override_skypilot_config(
                 'Failed to override the SkyPilot config on API '
                 'server with your local SkyPilot config:\n'
                 '=== SkyPilot config on API server ===\n'
-                f'{yaml_utils.dump_yaml_str(dict(original_config))}\n'
+                f'{config_utils.dump_redacted_yaml(original_config)}\n'
                 '=== Your local SkyPilot config ===\n'
-                f'{yaml_utils.dump_yaml_str(dict(override_configs))}\n'
+                f'{config_utils.dump_redacted_yaml(override_configs)}\n'
                 f'Details: {e}') from e
     finally:
+        _get_config_context().server_config = outer_server_config
         _set_loaded_config(original_config)
         _set_config_overridden(False)
         _set_loaded_config_path_serialized(original_config_path)
+
+
+@contextlib.contextmanager
+def replace_skypilot_config_in_process(
+        new_configs: config_utils.Config) -> Iterator[None]:
+    """Replaces the loaded config for the current process or context only.
+
+    Unlike :func:`replace_skypilot_config`, no temporary config file is
+    written and ``SKYPILOT_CONFIG`` is left untouched, so subprocesses
+    spawned inside the block keep seeing the original config. Use it when
+    only in-process readers need the replacement, e.g. a per-launch default
+    consumed by the provisioner.
+    """
+    original_config = _get_loaded_config()
+    if new_configs == original_config:
+        yield
+        return
+    _set_loaded_config(new_configs)
+    try:
+        yield
+    finally:
+        _set_loaded_config(original_config)
 
 
 @contextlib.contextmanager
@@ -824,27 +1378,33 @@ def replace_skypilot_config(new_configs: config_utils.Config) -> Iterator[None]:
     original_config_path = loaded_config_path_serialized()
     original_env_var = os.environ.get(ENV_VAR_SKYPILOT_CONFIG)
     if new_configs != original_config:
-        # Modify the global config of current process or context
-        _set_loaded_config(new_configs)
-        with tempfile.NamedTemporaryFile(delete=False,
-                                         mode='w',
-                                         prefix='mutated-skypilot-config-',
-                                         suffix='.yaml') as temp_file:
-            yaml_utils.dump_yaml(temp_file.name, dict(**new_configs))
-        # Modify the env var of current process or context so that the
-        # new config will be used by spawned sub-processes.
-        # Note that this code modifies os.environ directly because it
-        # will be hijacked to be context-aware if a context is active.
-        os.environ[ENV_VAR_SKYPILOT_CONFIG] = temp_file.name
-        _set_loaded_config_path(temp_file.name)
-        yield
-        # Restore the original config and env var.
-        _set_loaded_config(original_config)
-        _set_loaded_config_path_serialized(original_config_path)
-        if original_env_var:
-            os.environ[ENV_VAR_SKYPILOT_CONFIG] = original_env_var
-        else:
-            os.environ.pop(ENV_VAR_SKYPILOT_CONFIG, None)
+        try:
+            # Modify the global config of current process or context
+            _set_loaded_config(new_configs)
+            with tempfile.NamedTemporaryFile(delete=False,
+                                             mode='w',
+                                             prefix='mutated-skypilot-config-',
+                                             suffix='.yaml') as temp_file:
+                yaml_utils.dump_yaml(temp_file.name, dict(**new_configs))
+            # Modify the env var of current process or context so that the
+            # new config will be used by spawned sub-processes.
+            # Note that this code modifies os.environ directly because it
+            # will be hijacked to be context-aware if a context is active.
+            os.environ[ENV_VAR_SKYPILOT_CONFIG] = temp_file.name
+            _set_loaded_config_path(temp_file.name)
+            yield
+        finally:
+            # Restore the original config and env var. This must happen even
+            # if the body raises: while ENV_VAR_SKYPILOT_CONFIG is set,
+            # `reload_config()` reads the temporary file instead of the real
+            # config, so leaving it in place makes every later config reload
+            # in this process or context see the replacement config.
+            _set_loaded_config(original_config)
+            _set_loaded_config_path_serialized(original_config_path)
+            if original_env_var:
+                os.environ[ENV_VAR_SKYPILOT_CONFIG] = original_env_var
+            else:
+                os.environ.pop(ENV_VAR_SKYPILOT_CONFIG, None)
     else:
         yield
 
@@ -857,11 +1417,23 @@ _QUEUE_NAME_KEYS: List[Tuple[str, ...]] = [
     ('kueue', 'local_queue_name'),
 ]
 
+# Slurm names its queue (the sbatch `--qos`) and account under `quota`; the
+# `sbatch_options.qos` / `sbatch_options.account` spellings are merged
+# separately by `sky/clouds/slurm.py` and only apply when no `quota.*` value
+# is set at any scope.
+_SLURM_QUEUE_NAME_KEYS: List[Tuple[str, ...]] = [('quota', 'queue')]
+_SLURM_ACCOUNT_KEYS: List[Tuple[str, ...]] = [('quota', 'account')]
+
+_NAMESPACE_KEYS: List[Tuple[str, ...]] = [('namespace',)]
+
+_QUEUE_ADMISSION_TIMEOUT_KEYS: List[Tuple[str, ...]] = [
+    ('kueue', 'admission_timeout'),
+]
+
 # Hooks invoked at the end of `update_api_server_config_no_lock`, after the
-# new config has been persisted and reloaded in-process. Plugins use this to
-# invalidate caches that were derived from the config (e.g. a request that
-# memoized the result of `get_nested(...)` for a TTL). Registered at server
-# startup during single-threaded plugin loading, so no lock is needed.
+# new config has been persisted and reloaded in-process, e.g. to invalidate
+# state derived from the config. Registered at server startup during
+# single-threaded plugin loading, so no lock is needed.
 _CONFIG_UPDATE_HOOKS: List[Callable[[], None]] = []
 
 
@@ -877,20 +1449,143 @@ def register_config_update_hook(fn: Callable[[], None]) -> None:
         _CONFIG_UPDATE_HOOKS.append(fn)
 
 
-def get_effective_queue_name(
+def register_task_overrideable_config_key(key: Tuple[str, ...]) -> None:
+    """Register a config key that may be overridden via a task YAML.
+
+    Extends ``constants.OVERRIDEABLE_CONFIG_KEYS_IN_TASK`` so the key is
+    accepted in a task's ``config`` field, survives ``Resources.copy()``,
+    and may be passed to ``get_nested`` via ``override_configs``. This
+    lets plugins make their config keys tunable per task instead of only
+    server-wide.
+
+    The key must already exist in the global config schema (e.g. added
+    via ``schemas.register_jobs_property``) before this is called, since
+    the task-level config schema is derived from the global one.
+
+    Called at server startup during plugin loading (single-threaded), so
+    no lock is needed.
+    """
+    # Fail fast at registration time if the key is not part of the
+    # config schema — otherwise the first task-schema build would fail
+    # with an opaque assertion inside schema filtering.
+    node: Dict[str, Any] = schemas.get_config_schema()
+    for part in key:
+        properties = node.get('properties', {})
+        if part not in properties:
+            raise ValueError(
+                f'Cannot register task-overrideable config key {key!r}: '
+                f'{".".join(key)} is not present in the config schema. '
+                'Register the schema property first (e.g. via '
+                'schemas.register_jobs_property).')
+        node = properties[part]
+    if key not in constants.OVERRIDEABLE_CONFIG_KEYS_IN_TASK:
+        constants.OVERRIDEABLE_CONFIG_KEYS_IN_TASK.append(key)
+
+
+# Validators invoked at the start of `update_api_server_config_no_lock`,
+# before the new config is persisted. Each validator receives the currently
+# persisted config and the incoming config, and may reject the save by
+# raising. Server-side integrations use this to enforce invariants and block
+# invalid or conflicting config changes before they take effect. Registered at
+# server startup during single-threaded plugin loading, so no lock is needed.
+_CONFIG_SAVE_VALIDATORS: List[Callable[
+    [config_utils.Config, config_utils.Config], None]] = []
+
+
+def register_config_save_validator(
+        fn: Callable[[config_utils.Config, config_utils.Config], None]) -> None:
+    """Register a validator invoked before the API server config is saved.
+
+    Called at server startup during plugin loading (single-threaded), so no
+    lock is needed. Each validator is called as ``fn(current, incoming)``
+    before the incoming config is persisted, where ``current`` is the
+    currently persisted config and ``incoming`` is the config about to be
+    saved. A validator vetoes the save by raising; unlike
+    `register_config_update_hook`, exceptions are NOT caught -- they propagate
+    to the caller so the save is aborted. Validators must not mutate the
+    config.
+    """
+    if fn not in _CONFIG_SAVE_VALIDATORS:
+        _CONFIG_SAVE_VALIDATORS.append(fn)
+
+
+# Post-save hooks invoked at the end of `update_api_server_config_no_lock`,
+# after the new config has been persisted and reloaded in-process. Unlike
+# `register_config_update_hook`, each hook receives the previously persisted
+# config, the newly persisted config, and the user who made the change.
+ConfigPostSaveHook = Callable[
+    [config_utils.Config, config_utils.Config, Optional['models.User']], None]
+_CONFIG_POST_SAVE_HOOKS: List[ConfigPostSaveHook] = []
+
+
+def register_config_post_save_hook(fn: ConfigPostSaveHook) -> None:
+    """Register a hook invoked after the API server config is saved.
+
+    Called at server startup during plugin loading (single-threaded), so no
+    lock is needed. Each hook is called as ``fn(old, new, user)`` after the
+    new config has been persisted and reloaded, where ``old`` is the
+    previously persisted config, ``new`` is the config that was just saved,
+    and ``user`` is the user who made the change. Hooks receive copies, so
+    mutating them has no effect. Like `register_config_update_hook`,
+    exceptions are caught and logged so a misbehaving hook cannot fail the
+    config update.
+    """
+    if fn not in _CONFIG_POST_SAVE_HOOKS:
+        _CONFIG_POST_SAVE_HOOKS.append(fn)
+
+
+def _region_scope_prefixes(
         cloud: str,
+        region: Optional[str],
+        partition: Optional[str] = None) -> List[Tuple[str, ...]]:
+    """Key prefixes for one cloud's config subtree, most specific first.
+
+    Kubernetes and SSH scope per-context values under ``context_configs``;
+    Slurm scopes per-cluster values under ``cluster_configs`` with a further
+    ``partition_configs`` level below it.
+    """
+    prefixes: List[Tuple[str, ...]] = []
+    if region is not None:
+        if cloud == 'slurm':
+            if partition is not None:
+                prefixes.append((cloud, 'cluster_configs', region,
+                                 'partition_configs', partition))
+            prefixes.append((cloud, 'cluster_configs', region))
+        else:
+            prefixes.append((cloud, 'context_configs', region))
+    prefixes.append((cloud,))
+    return prefixes
+
+
+def _get_effective_scoped_config_value(
+        cloud: str,
+        property_keys: List[Tuple[str, ...]],
         region: Optional[str] = None,
         workspace: Optional[str] = None,
-        override_configs: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    """Returns the effective Kueue local queue name from config.
+        override_configs: Optional[Dict[str, Any]] = None,
+        partition: Optional[str] = None) -> Optional[str]:
+    """Generic scoped config-value resolver.
 
-    Supports two equivalent spellings, ``kueue.local_queue_name`` and
-    ``quota.queue``. Scope precedence (workspace > global; context > cloud)
-    takes priority over spelling; within the same scope, ``quota.queue``
-    wins over ``kueue.local_queue_name`` when both are set.
+    Resolution precedence (most specific first), where ``<scope>`` walks the
+    prefixes from ``_region_scope_prefixes`` (``context_configs.<region>``
+    for Kubernetes / SSH; ``cluster_configs.<region>.partition_configs
+    .<partition>`` then ``cluster_configs.<region>`` for Slurm):
+
+    1. ``workspaces.<workspace>.<cloud>.<scope>.<property>``
+    2. ``workspaces.<workspace>.<cloud>.<property>``
+    3. ``<cloud>.<scope>.<property>``
+    4. ``<cloud>.<property>``
+    5. ``None`` — caller is responsible for any default.
+
+    Within a scope, ``property_keys`` are tried in order; the first non-None
+    hit wins. For single-spelling fields pass ``[('namespace',)]``; for
+    multi-spelling fields pass e.g. ``[('quota', 'queue'),
+    ('kueue', 'local_queue_name')]`` to express "quota.queue wins over
+    kueue.local_queue_name when both are set at the same scope".
     """
     if workspace is None:
         workspace = get_active_workspace()
+    prefixes = _region_scope_prefixes(cloud, region, partition)
 
     # `override_configs` are cloud-level; looking up relative to a scope
     # (rather than prefixing the scope into `keys`) ensures they apply at
@@ -911,19 +1606,171 @@ def get_effective_queue_name(
                 scope_config.get_nested(keys=(),
                                         default_value={},
                                         override_configs=override_configs))
-        if region is not None:
-            for queue_keys in _QUEUE_NAME_KEYS:
-                value = scope_config.get_nested(
-                    keys=(cloud, 'context_configs', region) + queue_keys,
-                    default_value=None)
+        for prefix in prefixes:
+            for property_key in property_keys:
+                value = scope_config.get_nested(keys=prefix + property_key,
+                                                default_value=None)
                 if value is not None:
                     return value
-        for queue_keys in _QUEUE_NAME_KEYS:
-            value = scope_config.get_nested(keys=(cloud,) + queue_keys,
-                                            default_value=None)
-            if value is not None:
-                return value
     return None
+
+
+def get_effective_queue_name(cloud: str,
+                             region: Optional[str] = None,
+                             workspace: Optional[str] = None,
+                             override_configs: Optional[Dict[str, Any]] = None,
+                             partition: Optional[str] = None) -> Optional[str]:
+    """Returns the effective queue name from config.
+
+    For Kubernetes this is the Kueue local queue, spelled either
+    ``kueue.local_queue_name`` or ``quota.queue``. Scope precedence
+    (workspace > global; context > cloud) takes priority over spelling;
+    within the same scope, ``quota.queue`` wins over
+    ``kueue.local_queue_name`` when both are set.
+
+    For Slurm this is the QOS the job is submitted with (``sbatch --qos``),
+    spelled ``quota.queue``, scoped workspace > global and partition >
+    cluster > cloud. ``partition`` selects the ``partition_configs`` level.
+    """
+    if cloud == 'slurm':
+        property_keys = _SLURM_QUEUE_NAME_KEYS
+    else:
+        property_keys = _QUEUE_NAME_KEYS
+    return _get_effective_scoped_config_value(cloud=cloud,
+                                              property_keys=property_keys,
+                                              region=region,
+                                              workspace=workspace,
+                                              override_configs=override_configs,
+                                              partition=partition)
+
+
+def get_effective_slurm_account(
+        cluster: Optional[str] = None,
+        partition: Optional[str] = None,
+        workspace: Optional[str] = None,
+        override_configs: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Returns the effective Slurm account (``sbatch --account``) from config.
+
+    Spelled ``slurm.quota.account``, scoped workspace > global and
+    partition > cluster > cloud, the same walk as
+    :func:`get_effective_queue_name` for Slurm.
+    """
+    return _get_effective_scoped_config_value(cloud='slurm',
+                                              property_keys=_SLURM_ACCOUNT_KEYS,
+                                              region=cluster,
+                                              workspace=workspace,
+                                              override_configs=override_configs,
+                                              partition=partition)
+
+
+def get_effective_slurm_quota_value(
+        key: str,
+        cluster: Optional[str] = None,
+        partition: Optional[str] = None,
+        workspace: Optional[str] = None,
+        override_configs: Optional[Dict[str, Any]] = None) -> Any:
+    """Returns a ``slurm.quota.<key>`` value, scope-resolved.
+
+    The ``slurm.quota`` block is deliberately permissive
+    (``additionalProperties: True``) so that consumers can carry
+    scheduler-specific sub-fields beyond the ``queue`` and ``account`` that
+    :func:`get_effective_queue_name` and :func:`get_effective_slurm_account`
+    read. This is the generic counterpart to those two: it resolves any such
+    sub-field over the same scopes -- workspace > global, and within each,
+    partition > cluster > cloud -- so a consumer does not have to reimplement
+    the walk and risk resolving its own field differently from ``queue``.
+
+    Returns ``Any`` rather than ``Optional[str]``, unlike the two named
+    getters: their fields are declared ``{'type': 'string'}`` and so are
+    validated as strings before they get here, while ``additionalProperties``
+    constrains nothing, so a sub-field can hold a number, a bool, a list or a
+    mapping. Narrowing the annotation would let a caller run string
+    operations on a value the schema never promised was a string. Validating
+    the type is the caller's job, the same split the ``slurm.quota`` schema
+    comment already describes.
+
+    Args:
+        key: The sub-field under ``slurm.quota`` to read.
+        cluster: Slurm cluster, selecting the ``cluster_configs`` level.
+        partition: Partition, selecting the ``partition_configs`` level.
+        workspace: Workspace to read first; defaults to the active one.
+        override_configs: Task-level ``config`` overrides.
+
+    Returns:
+        The resolved value as configured, or None if the field is unset at
+        every scope.
+    """
+    return _get_effective_scoped_config_value(cloud='slurm',
+                                              property_keys=[('quota', key)],
+                                              region=cluster,
+                                              workspace=workspace,
+                                              override_configs=override_configs,
+                                              partition=partition)
+
+
+def get_effective_queue_admission_timeout(
+        cloud: str,
+        region: Optional[str] = None,
+        workspace: Optional[str] = None,
+        override_configs: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Returns the effective ``kueue.admission_timeout``, or None if unset.
+
+    Bound, in seconds, on how long a launch waits for pods held by a
+    scheduling gate to be admitted; ``-1`` waits indefinitely. Resolved with
+    the same scope precedence as :func:`get_effective_queue_name` (workspace
+    over global, context over cloud), with ``override_configs`` (a task's
+    ``config`` block) merged in at every scope.
+    """
+    value = _get_effective_scoped_config_value(
+        cloud=cloud,
+        property_keys=_QUEUE_ADMISSION_TIMEOUT_KEYS,
+        region=region,
+        workspace=workspace,
+        override_configs=override_configs)
+    if value is None:
+        return None
+    return int(value)
+
+
+def get_effective_kai_value(
+        key: Literal['queue', 'preemptibility', 'topology',
+                     'required_topology_level', 'preferred_topology_level'],
+        region: Optional[str] = None,
+        workspace: Optional[str] = None,
+        override_configs: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Returns a ``kubernetes.kai.<key>`` value, or None if unset.
+
+    Resolved with the same scope precedence as :func:`get_effective_queue_name`
+    (workspace over global, context over cloud), with ``override_configs`` (a
+    task's ``config`` block) merged in at every scope.
+    """
+    return _get_effective_scoped_config_value(cloud='kubernetes',
+                                              property_keys=[('kai', key)],
+                                              region=region,
+                                              workspace=workspace,
+                                              override_configs=override_configs)
+
+
+def get_effective_namespace(
+        cloud: str,
+        region: Optional[str] = None,
+        workspace: Optional[str] = None,
+        override_configs: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Returns the effective Kubernetes namespace from config.
+
+    Resolution precedence, most specific first:
+
+    1. ``workspaces.<workspace>.<cloud>.context_configs.<region>.namespace``
+    2. ``workspaces.<workspace>.<cloud>.namespace``
+    3. ``<cloud>.context_configs.<region>.namespace``
+    4. ``<cloud>.namespace``
+    5. ``None`` — caller is responsible for the kubeconfig-default fallback.
+    """
+    return _get_effective_scoped_config_value(cloud=cloud,
+                                              property_keys=_NAMESPACE_KEYS,
+                                              region=region,
+                                              workspace=workspace,
+                                              override_configs=override_configs)
 
 
 def register_queue_name_key(key: Tuple[str, ...]) -> None:
@@ -938,31 +1785,38 @@ def register_queue_name_key(key: Tuple[str, ...]) -> None:
 
 @contextlib.contextmanager
 def remove_queue_name_from_config() -> Iterator[None]:
-    """Removes the local_queue_name from the config."""
+    """Removes the local_queue_name and the KAI config from the config."""
     config = to_dict()
 
-    def update_to_none_if_set(keys: Tuple[str, ...]) -> None:
+    def pop_if_set(keys: Tuple[str, ...]) -> None:
         for queue_key in _QUEUE_NAME_KEYS:
             if config.get_nested(keys + queue_key, None) is not None:
-                logger.debug(f'removing local queue name: setting '
-                             f'{keys + queue_key} to None')
-                config.set_nested(keys + queue_key, None)
+                logger.debug(f'removing local queue name: {keys + queue_key}')
+                # Pop the key instead of setting it to None: the queue name
+                # schemas require a string, so a literal null fails schema
+                # validation when the mutated config is loaded again (e.g. by
+                # anything reading the config file pointed to by
+                # SKYPILOT_CONFIG while the override is active).
+                config.pop_nested(keys + queue_key, None)
+        # The whole block: its other keys are rejected without a KAI queue.
+        config.pop_nested(keys + ('kai',), None)
 
     def remove_from_context_configs(keys: Tuple[str, ...]) -> None:
         for context_name, _ in config.get_nested((*keys, 'context_configs'),
                                                  {}).items():
-            update_to_none_if_set((*keys, 'context_configs', context_name))
+            pop_if_set((*keys, 'context_configs', context_name))
 
     # remove from global config
-    update_to_none_if_set(('kubernetes',))
+    pop_if_set(('kubernetes',))
     remove_from_context_configs(('kubernetes',))
     # remove from all workspaces configs
     for workspace_name, _ in config.get_nested(('workspaces',), {}).items():
-        update_to_none_if_set(('workspaces', workspace_name, 'kubernetes'))
+        pop_if_set(('workspaces', workspace_name, 'kubernetes'))
         remove_from_context_configs(
             ('workspaces', workspace_name, 'kubernetes'))
     logger.debug(
-        f'config without local queue: {yaml_utils.dump_yaml_str(dict(config))}')
+        f'config without local queue: {config_utils.dump_redacted_yaml(config)}'
+    )
     with replace_skypilot_config(config):
         yield
 
@@ -1011,9 +1865,9 @@ def apply_cli_config(cli_config: Optional[List[str]]) -> Dict[str, Any]:
         list of key-value pairs.
     """
     parsed_config = _compose_cli_config(cli_config)
-    if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+    if sky_logging.will_log(logger, sky_logging.DEBUG):
         logger.debug(f'applying following CLI overrides: \n'
-                     f'{yaml_utils.dump_yaml_str(dict(parsed_config))}')
+                     f'{config_utils.dump_redacted_yaml(parsed_config)}')
     _set_loaded_config(
         overlay_skypilot_config(original_config=_get_loaded_config(),
                                 override_configs=parsed_config))
@@ -1035,6 +1889,22 @@ def update_api_server_config_no_lock(config: config_utils.Config) -> None:
             constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
         raise ValueError('This function can only be called by the API Server.')
 
+    # Capture the currently persisted config before it is overwritten, for
+    # save validators and post-save hooks (to_dict() returns a fresh copy).
+    old_config: Optional[config_utils.Config] = None
+    if _CONFIG_SAVE_VALIDATORS or _CONFIG_POST_SAVE_HOOKS:
+        old_config = to_dict()
+
+    # Run registered validators before persisting the config, so a validator
+    # can veto the save by raising; exceptions propagate to abort the update.
+    # Validators must not mutate the config, so hand them a deep copy of the
+    # incoming config.
+    if _CONFIG_SAVE_VALIDATORS:
+        assert old_config is not None
+        incoming = copy.deepcopy(config)
+        for validator in list(_CONFIG_SAVE_VALIDATORS):
+            validator(old_config, incoming)
+
     global_config_path = _resolve_server_config_path()
     if global_config_path is None:
         # Fallback to ~/.sky/config.yaml, and make sure it exists.
@@ -1051,6 +1921,9 @@ def update_api_server_config_no_lock(config: config_utils.Config) -> None:
 
             def _set_config_yaml_to_db(key: str, config: config_utils.Config):
                 engine = _db_manager.get_engine()
+                # Persisting, not logging: this value is read back as the
+                # server config, so it must be the real one. Do not route it
+                # through config_utils.dump_redacted_yaml().
                 config_str = yaml_utils.dump_yaml_str(dict(config))
                 with orm.Session(engine) as session:
                     if (engine.dialect.name ==
@@ -1075,7 +1948,8 @@ def update_api_server_config_no_lock(config: config_utils.Config) -> None:
 
     if not db_updated:
         # save to the local file (PVC in Kubernetes, local file otherwise)
-        yaml_utils.dump_yaml(global_config_path, dict(config))
+        # Replaced, not truncated: readers reload this file without the lock.
+        yaml_utils.dump_yaml_atomic(global_config_path, dict(config))
 
         if config_map_utils.is_running_in_kubernetes():
             # In Kubernetes, sync the PVC config to ConfigMap for user
@@ -1092,3 +1966,17 @@ def update_api_server_config_no_lock(config: config_utils.Config) -> None:
         except Exception as e:  # pylint: disable=broad-except
             logger.warning(f'Config-update hook {hook!r} raised: {e}',
                            exc_info=True)
+    if _CONFIG_POST_SAVE_HOOKS:
+        assert old_config is not None
+        user = common_utils.get_current_user()
+        # At this point `config` reflects what was persisted (e.g. with the
+        # ('db',) key stripped); hand each hook its own copies so mutations
+        # by one hook cannot leak into another.
+        for post_save_hook in list(_CONFIG_POST_SAVE_HOOKS):
+            try:
+                post_save_hook(copy.deepcopy(old_config), copy.deepcopy(config),
+                               user)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.warning(
+                    f'Config post-save hook {post_save_hook!r} raised: {e}',
+                    exc_info=True)

@@ -74,6 +74,7 @@ def _generate_scale_down_decisions(
 def _select_nonterminal_replicas_to_scale_down(
     num_replica_to_scale_down: int,
     replica_infos: Iterable['replica_managers.ReplicaInfo'],
+    service_name: Optional[str] = None,
 ) -> List[int]:
     """Select nonterminal replicas to scale down.
 
@@ -83,7 +84,10 @@ def _select_nonterminal_replicas_to_scale_down(
             later stage may become ready soon.
         2. Based on the version in ascending order, so we scale down the older
             versions first.
-        3. Based on the replica_id in descending order, which is also the order
+        3. For pools, based on the number of running jobs in ascending order,
+            so we scale down idle workers first. For SkyServe services, job
+            counts will be zero so this criterion has no effect.
+        4. Based on the replica_id in descending order, which is also the order
             of the replicas being launched. We scale down the replicas that are
             launched earlier first, as the replicas that are launched later may
             become ready soon.
@@ -91,6 +95,8 @@ def _select_nonterminal_replicas_to_scale_down(
     Args:
         num_replica_to_scale_down: The number of replicas to scale down.
         replica_infos: The list of replica informations to select from.
+        service_name: The name of the pool to query job counts for. When
+            provided, replicas with fewer running jobs are scaled down first.
 
     Returns:
         The list of replica ids to scale down.
@@ -100,12 +106,27 @@ def _select_nonterminal_replicas_to_scale_down(
     assert all(info.status in status_order for info in replicas), (
         'All replicas to scale down should be in provisioning or launched '
         'status.', replicas)
+
+    # Get the number of running jobs for each replica. For pools this
+    # prioritizes scaling down idle workers; when service_name is not
+    # provided all counts default to 0 and the sort falls through.
+    cluster_job_counts: Dict[str, int] = {}
+    if service_name is not None:
+        cluster_job_counts = (
+            managed_job_state.get_nonterminal_job_counts_by_pool(service_name))
+    replica_job_counts: Dict[int, int] = {}
+    for info in replicas:
+        replica_job_counts[info.replica_id] = (cluster_job_counts.get(
+            info.cluster_name, 0))
+
     replicas = sorted(
         replicas,
         key=lambda info: (
             status_order.index(info.status),
             # version in ascending order
             info.version,
+            # number of running jobs in ascending order
+            replica_job_counts[info.replica_id],
             # replica_id in descending order, i.e. launched order
             -info.replica_id))
     assert len(replicas) >= num_replica_to_scale_down, (
@@ -119,8 +140,10 @@ class Autoscaler:
 
     # --------------- APIs to implement for custom autoscaler ---------------
 
-    def __init__(self, service_name: str,
-                 spec: 'service_spec.SkyServiceSpec') -> None:
+    def __init__(self,
+                 service_name: str,
+                 spec: 'service_spec.SkyServiceSpec',
+                 version: int = constants.INITIAL_VERSION) -> None:
         """Initialize the autoscaler.
 
         Variables:
@@ -139,7 +162,7 @@ class Autoscaler:
         self.num_overprovision: Optional[int] = spec.num_overprovision
         # Target number of replicas is initialized to min replicas
         self.target_num_replicas: int = spec.min_replicas
-        self.latest_version: int = constants.INITIAL_VERSION
+        self.latest_version: int = version
         # The latest_version_ever_ready should be smaller than the
         # latest_version, so we can fail early if the initial version got
         # unrecoverable failure.
@@ -209,19 +232,22 @@ class Autoscaler:
                                           target_num_replicas))
 
     @classmethod
-    def from_spec(cls, service_name: str,
-                  spec: 'service_spec.SkyServiceSpec') -> 'Autoscaler':
+    def from_spec(cls,
+                  service_name: str,
+                  spec: 'service_spec.SkyServiceSpec',
+                  version: int = constants.INITIAL_VERSION) -> 'Autoscaler':
         # TODO(MaoZiming): use NAME to get the class.
         if spec.pool:
-            return QueueLengthAutoscaler(service_name, spec)
+            return QueueLengthAutoscaler(service_name, spec, version)
         elif spec.use_ondemand_fallback:
-            return FallbackRequestRateAutoscaler(service_name, spec)
+            return FallbackRequestRateAutoscaler(service_name, spec, version)
         elif isinstance(spec.target_qps_per_replica, dict):
             # Use instance-aware autoscaler
             # when target_qps_per_replica is a dict
-            return InstanceAwareRequestRateAutoscaler(service_name, spec)
+            return InstanceAwareRequestRateAutoscaler(service_name, spec,
+                                                      version)
         else:
-            return RequestRateAutoscaler(service_name, spec)
+            return RequestRateAutoscaler(service_name, spec, version)
 
     def get_decision_interval(self) -> int:
         """Get the decision interval for the autoscaler.
@@ -392,8 +418,10 @@ class _AutoscalerWithHysteresis(Autoscaler):
             downscale_delay_seconds /
             constants.AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS)
 
-    def __init__(self, service_name: str,
-                 spec: 'service_spec.SkyServiceSpec') -> None:
+    def __init__(self,
+                 service_name: str,
+                 spec: 'service_spec.SkyServiceSpec',
+                 version: int = constants.INITIAL_VERSION) -> None:
         """Initialize the hysteresis autoscaler.
 
         Variables:
@@ -402,7 +430,7 @@ class _AutoscalerWithHysteresis(Autoscaler):
             scale_up_threshold: The threshold to trigger a scale up.
             scale_down_threshold: The threshold to trigger a scale down.
         """
-        super().__init__(service_name, spec)
+        super().__init__(service_name, spec, version)
         self.upscale_counter: int = 0
         self.downscale_counter: int = 0
         self._setup_thresholds(spec)
@@ -463,8 +491,10 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
     either spot or on-demand, but not both.
     """
 
-    def __init__(self, service_name: str,
-                 spec: 'service_spec.SkyServiceSpec') -> None:
+    def __init__(self,
+                 service_name: str,
+                 spec: 'service_spec.SkyServiceSpec',
+                 version: int = constants.INITIAL_VERSION) -> None:
         """Initialize the request rate autoscaler.
 
         Variables:
@@ -472,7 +502,7 @@ class RequestRateAutoscaler(_AutoscalerWithHysteresis):
             qps_window_size: Window size for qps calculating.
             request_timestamps: All request timestamps within the window.
         """
-        super().__init__(service_name, spec)
+        super().__init__(service_name, spec, version)
         self.target_qps_per_replica: Optional[Union[float, Dict[
             str, float]]] = spec.target_qps_per_replica
         self.qps_window_size: int = constants.AUTOSCALER_QPS_WINDOW_SIZE_SECONDS
@@ -590,9 +620,11 @@ class InstanceAwareRequestRateAutoscaler(RequestRateAutoscaler):
     to their respective QPS targets.
     """
 
-    def __init__(self, service_name: str,
-                 spec: 'service_spec.SkyServiceSpec') -> None:
-        super().__init__(service_name, spec)
+    def __init__(self,
+                 service_name: str,
+                 spec: 'service_spec.SkyServiceSpec',
+                 version: int = constants.INITIAL_VERSION) -> None:
+        super().__init__(service_name, spec, version)
         # Ensure target_qps_per_replica is a dict for instance-aware logic
         assert isinstance(spec.target_qps_per_replica, dict), \
             'InstanceAware Autoscaler requires dict type target_qps_per_replica'
@@ -940,8 +972,10 @@ class FallbackRequestRateAutoscaler(RequestRateAutoscaler):
             spec.dynamic_ondemand_fallback
             if spec.dynamic_ondemand_fallback is not None else False)
 
-    def __init__(self, service_name: str,
-                 spec: 'service_spec.SkyServiceSpec') -> None:
+    def __init__(self,
+                 service_name: str,
+                 spec: 'service_spec.SkyServiceSpec',
+                 version: int = constants.INITIAL_VERSION) -> None:
         """Initialize the fallback request rate autoscaler.
 
         Variables:
@@ -950,7 +984,7 @@ class FallbackRequestRateAutoscaler(RequestRateAutoscaler):
             dynamic_ondemand_fallback: Whether to dynamically provision
                 on-demand instances for preempted spot instances.
         """
-        super().__init__(service_name, spec)
+        super().__init__(service_name, spec, version)
         self._setup_fallback_options(spec)
 
     def update_version(self, version: int, spec: 'service_spec.SkyServiceSpec',
@@ -1079,8 +1113,10 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
     Uses hysteresis to prevent rapid scaling decisions.
     """
 
-    def __init__(self, service_name: str,
-                 spec: 'service_spec.SkyServiceSpec') -> None:
+    def __init__(self,
+                 service_name: str,
+                 spec: 'service_spec.SkyServiceSpec',
+                 version: int = constants.INITIAL_VERSION) -> None:
         """Initialize the queue length autoscaler.
 
         Variables:
@@ -1088,7 +1124,7 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
             scaling up or down.
             service_name: The pool name (used to query pending jobs).
         """
-        super().__init__(service_name, spec)
+        super().__init__(service_name, spec, version)
         # Use default threshold if not specified
         self.queue_length_threshold = (
             spec.queue_length_threshold
@@ -1258,7 +1294,8 @@ class QueueLengthAutoscaler(_AutoscalerWithHysteresis):
                 # Select replicas to scale down from idle replicas only
                 replicas_to_scale_down = (
                     _select_nonterminal_replicas_to_scale_down(
-                        actual_num_to_scale_down, idle_replicas))
+                        actual_num_to_scale_down, idle_replicas,
+                        self._service_name))
                 logger.info(
                     f'[QueueLengthAutoscaler] Number of replicas to scale down:'
                     f' {actual_num_to_scale_down} {replicas_to_scale_down}')

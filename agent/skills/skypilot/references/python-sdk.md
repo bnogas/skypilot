@@ -17,7 +17,7 @@ result = sky.get(request_id)
 ### `sky.launch`
 
 ```python
-sky.launch(task: Union['sky.Task', 'sky.Dag'], cluster_name: Optional[str] = None, retry_until_up: bool = False, idle_minutes_to_autostop: Optional[int] = None, wait_for: Optional[autostop_lib.AutostopWaitFor] = None, dryrun: bool = False, down: bool = False, backend: Optional['backends.Backend'] = None, optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST, no_setup: bool = False, clone_disk_from: Optional[str] = None, fast: bool = False, _need_confirmation: bool = False, _is_launched_by_jobs_controller: bool = False, _is_launched_by_sky_serve_controller: bool = False, _disable_controller_check: bool = False, _file_mounts_blob_id: Optional[str] = None, _extra_launch_context: Optional[Dict[str, Any]] = None, _include_credentials: bool = False) -> server_common.RequestId[Tuple[Optional[int], Optional['backends.ResourceHandle']]]
+sky.launch(task: Union['sky.Task', 'sky.Dag'], cluster_name: Optional[str] = None, retry_until_up: bool = False, idle_minutes_to_autostop: Optional[int] = None, wait_for: Optional[autostop_lib.AutostopWaitFor] = None, dryrun: bool = False, down: bool = False, backend: Optional['backends.Backend'] = None, optimize_target: common.OptimizeTarget = common.OptimizeTarget.COST, no_setup: bool = False, clone_disk_from: Optional[str] = None, fast: bool = False, resize: bool = False, _need_confirmation: bool = False, _is_launched_by_jobs_controller: bool = False, _is_launched_by_sky_serve_controller: bool = False, _file_mounts_blob_id: Optional[str] = None, _extra_launch_context: Optional[Dict[str, Any]] = None, _include_credentials: bool = False) -> server_common.RequestId[Tuple[Optional[int], Optional['backends.ResourceHandle']]]
 ```
 
 Launches a cluster or task.
@@ -82,6 +82,11 @@ task; support for pipelines/general DAGs are in experimental branches.
       different availability zone or region.
     fast: [Experimental] If the cluster is already up and available,
       skip provisioning and setup steps.
+    resize: if True, resize the existing cluster to the ``num_nodes``
+      specified in the task. Supports both scaling up (adding workers)
+      and scaling down (removing workers). Scale-down requires no
+      running jobs on the cluster. If True, requires ``cluster_name``
+      to be set.
     _need_confirmation: (Internal only) If True, show the confirmation
         prompt.
 
@@ -108,11 +113,13 @@ task; support for pipelines/general DAGs are in experimental branches.
       as:
 
       1. Empty: iff the first-ever sky.optimize() fails to find a feasible
-         resource; no pre-check or actual launch is attempted.
+         resource on reachable infra; no pre-check or actual launch is
+         attempted.
 
       2. Non-empty: iff at least 1 exception from either our pre-checks
-         (e.g., cluster name invalid) or a region/zone throwing resource
-         unavailability.
+         (e.g., cluster name invalid), a region/zone throwing resource
+         unavailability, or infra that could not be reached while
+         checking feasibility.
 
     exceptions.CommandError: any ssh command error.
     exceptions.NoCloudAccessError: if all clouds are disabled.
@@ -626,6 +633,33 @@ Gets the status of jobs on a cluster.
     sky.exceptions.CloudUserIdentityError: if we fail to get the current
         user identity.
 
+### `sky.cluster_job_spec`
+
+```python
+sky.cluster_job_spec(cluster_name: str, job_id: int) -> server_common.RequestId[Optional[Dict[str, Any]]]
+```
+
+Gets the task YAML and entrypoint a cluster job was submitted with.
+
+**Args:**
+    cluster_name: name of the cluster.
+    job_id: id of the job on the cluster.
+
+**Returns:**
+    The request ID of the cluster job spec request.
+
+**Request Returns:**
+    spec (Optional[Dict[str, Any]]): None if the cluster does not exist or
+        the job's spec was not recorded (e.g. it was submitted by an older
+        API server version), otherwise:
+
+        ```python
+
+            {
+                'task_yaml': (str) the task YAML, with secrets redacted,
+                'entrypoint': (str) the command that submitted the job,
+            }
+
 ### `sky.cancel`
 
 ```python
@@ -903,7 +937,7 @@ Finds the best execution plan for the given DAG.
 ### `sky.validate`
 
 ```python
-sky.validate(dag: 'sky.Dag', workdir_only: bool = False, admin_policy_request_options: Optional[admin_policy.RequestOptions] = None) -> None
+sky.validate(dag: 'sky.Dag', workdir_only: bool = False, admin_policy_request_options: Optional[admin_policy.RequestOptions] = None, _skip_local_paths: bool = False) -> None
 ```
 
 Validates the tasks.
@@ -920,6 +954,10 @@ Raises exceptions if the DAG is invalid.
     admin_policy_request_options: Request options used for admin policy
         validation. This is only required when a admin policy is in use,
         see: https://docs.skypilot.co/en/latest/cloud-setup/policy.html
+    _skip_local_paths: Do not check the workdir and file mount sources on
+        this machine. For callers whose sources are API server paths
+        inside an upload blob; the server resolves the blob and checks
+        the paths when it runs the request.
 
 ### `sky.reload_config`
 
@@ -971,7 +1009,7 @@ Deletes a storage.
 ### `sky.api_start`
 
 ```python
-sky.api_start(*, deploy: bool = False, host: str = '127.0.0.1', foreground: bool = False, metrics: bool = False, metrics_port: Optional[int] = None, enable_basic_auth: bool = False) -> None
+sky.api_start(*, deploy: bool = False, host: str = '127.0.0.1', foreground: bool = False, metrics: bool = False, metrics_port: Optional[int] = None, enable_basic_auth: bool = False, port: Optional[int] = None) -> None
 ```
 
 Starts the API server.
@@ -982,14 +1020,20 @@ exist.
 **Args:**
     deploy: Whether to deploy the API server, i.e. fully utilize the
         resources of the machine.
-    host: The host to deploy the API server. It will be set to 0.0.0.0
-        if deploy is True, to allow remote access.
+    host: The host to bind the API server to. Under deploy, the server
+        always binds a wildcard address for remote access: ``::`` when an
+        IPv6 host is given, otherwise ``0.0.0.0``. Without deploy the host
+        is used as-is.
     foreground: Whether to run the API server in the foreground (run in
         the current process).
     metrics: Whether to export metrics of the API server.
     metrics_port: The port to export metrics of the API server.
     enable_basic_auth: Whether to enable basic authentication
         in the API server.
+    port: The port to bind the API server to. Defaults to the
+        SKYPILOT_API_SERVER_LOCAL_PORT environment variable, or 46580.
+        Other client commands only find a server on a non-default port
+        if the same environment variable is exported.
 **Returns:**
     None
 
@@ -1020,7 +1064,9 @@ Lists all requests.
     all_status: Whether to list all finished requests as well. This argument
         is ignored if request_ids is not None.
     limit: The number of requests to show. If None, show all requests.
-    fields: The fields to get. If None, get all fields.
+    fields: The fields to get. If None, get all fields except
+        return_value and error. This argument is ignored if request_ids
+        is not None.
     cluster_name: Filter requests by cluster name.
         If None, show all requests.
 
@@ -1062,10 +1108,17 @@ sky.api_cancel(request_ids: Optional[Union[server_common.RequestId[T], List[serv
 
 Aborts a request or all requests.
 
+With neither request_ids nor all_users, aborts all of the caller's own
+requests.
+
 **Args:**
     request_ids: The request ID(s) to abort. Can be a single string or a
-        list of strings.
-    all_users: Whether to abort all requests from all users.
+        list of strings. On a server with per-user auth, an admin can
+        abort any request by id and other users only their own; on a
+        server without it, anyone can abort any request by id.
+    all_users: Whether to abort all requests from all users. On a server
+        with per-user auth, a non-admin aborts only their own. Cannot be
+        combined with request_ids.
     silent: Whether to suppress the output.
 
 **Returns:**
@@ -1075,8 +1128,7 @@ Aborts a request or all requests.
     A list of request IDs that were cancelled.
 
 **Raises:**
-    click.BadParameter: If no request ID is specified and not all or
-        all_users is not set.
+    ValueError: If both request_ids and all_users are given.
 
 ### `sky.api_server_logs`
 
@@ -1168,7 +1220,7 @@ may cause GET /api/get being sent to a restarted API server.
 ### `sky.stream_and_get`
 
 ```python
-sky.stream_and_get(request_id: Optional[server_common.RequestId[T]] = None, log_path: Optional[str] = None, tail: Optional[int] = None, follow: bool = True, output_stream: Optional['io.TextIOBase'] = None) -> Optional[T]
+sky.stream_and_get(request_id: Optional[server_common.RequestId[T]] = None, log_path: Optional[str] = None, tail: Optional[int] = None, follow: bool = True, output_stream: Optional['io.TextIOBase'] = None, relay_rich_status: bool = False) -> Optional[T]
 ```
 
 Streams the logs of a request or a log file and gets the final result.
@@ -1187,6 +1239,11 @@ prefix of the full request id.
     follow: Whether to follow the logs.
     output_stream: The output stream to write to. If None, print to the
         console.
+    relay_rich_status: If True, forward encoded rich-status control payloads
+        verbatim to the output instead of rendering a local spinner. Used by
+        the managed jobs controller to preserve provisioning spinner codes
+        in its per-job log. See
+        :func:`sky.utils.rich_utils.decode_rich_status`.
 
 **Returns:**
     The ``Request Returns`` of the specified request. See the documentation
@@ -1206,6 +1263,65 @@ sky.workspaces() -> server_common.RequestId[Dict[str, Any]]
 ```
 
 Gets the workspaces.
+
+### `sky.set_preferred_workspace`
+
+```python
+sky.set_preferred_workspace(preferred: Optional[str]) -> Dict[str, Any]
+```
+
+Sets (or clears with None) the user's preferred workspace.
+
+**Args:**
+    preferred: workspace name to set as default, or None to clear.
+
+**Returns:**
+    ``{'preferred': <new value>}`` echoing what was set. Callers that
+    need the resolved workspace + accessible list should follow up
+    with :func:`get_user_workspace`. Raises if the server rejects
+    the change (workspace does not exist, or user lacks permission
+    to it).
+
+### `sky.get_user_workspace`
+
+```python
+sky.get_user_workspace(requested: Optional[str] = None) -> Dict[str, Any]
+```
+
+Returns workspace state for the calling user.
+
+Mirrors the launch-path precedence — if the caller has an explicit
+``active_workspace``, the server returns that with ``source='explicit'``;
+otherwise the resolver runs (preferred / default-fallback /
+single-membership).
+
+**Args:**
+    requested: explicit active workspace to ask about. ``None`` (the
+        default) — the SDK reads your locally-configured
+        ``active_workspace`` (the value `skypilot_config` merges
+        from ``~/.sky/config.yaml`` + ``./.sky.yaml`` + any
+        ``--config active_workspace=X`` override) and forwards it
+        on the wire as ``?requested=``. Pass a non-None value to
+        query the resolver as if ``active_workspace`` were that
+        value, without changing your local config — useful for
+        previewing "what would land if I switched to X".
+
+**Returns:**
+    ``{workspace, source, note, preferred, accessible}``.
+
+    * ``workspace``: the workspace the launch path would pick. Can
+      be ``None`` when the resolver couldn't pick (no access /
+      ambiguous / explicit ``requested`` rejected by RBAC); the
+      reason is then in ``note``.
+    * ``source``: one of ``WORKSPACE_SOURCE_*`` on success, ``None``
+      when ``workspace`` is ``None``.
+    * ``note``: optional message — drift on success
+      (``preferred 'team-x' not accessible``) or the resolver error
+      when ``workspace`` is ``None``.
+    * ``preferred``: the persisted preferred workspace (``None`` if
+      unset).
+    * ``accessible``: sorted list of workspaces the user can launch
+      into.
 
 ## Other Functions
 
@@ -1250,6 +1366,55 @@ Download a debug dump from the server.
 
 **Returns:**
     Path to the downloaded file.
+
+### `sky.impersonate`
+
+```python
+sky.impersonate(user: str) -> Iterator[None]
+```
+
+Acts as another user for the SDK calls made in this context.
+
+Lets a service, such as a platform that launches workloads for its users,
+act on behalf of a user. Every request sent in the context runs as `user`:
+the user owns the clusters and jobs it creates, and the user's role and
+workspace permissions decide what it may do. The API server logs the
+service account behind each such request.
+
+By default, the API server must set ``rbac.allow_impersonation: true`` and
+the client must authenticate with the token of a service account whose
+role is admin; a server plugin can grant it differently. Either way,
+service accounts, built-in users and users whose role outranks the
+caller's cannot be impersonated, and impersonated requests cannot change
+users or service account tokens. Requests and their results are owned by
+`user`, so make follow-up calls such as :func:`sky.get` and
+:func:`sky.stream_and_get` in the same context. Contexts nest, and
+concurrent threads or asyncio tasks can each act as a different user.
+Threads started inside the context do not inherit it unless they copy the
+context (`contextvars.copy_context`).
+
+The ``SKYPILOT_IMPERSONATE_USER`` environment variable sets the same for
+every request of the process, including CLI commands; this context takes
+precedence over it.
+
+**Example:**
+    ```python
+
+        with sky.impersonate('alice@example.com'):
+            request_id = sky.jobs.launch(task)
+            sky.stream_and_get(request_id)
+
+**Args:**
+    user: The ID or name of the user to act as. A name must match exactly
+        one user.
+
+**Raises:**
+    ValueError: If ``user`` is empty, or if a request is sent in the
+        context without a service account token.
+    exceptions.PermissionDeniedError: If the API server refuses to let
+        the caller act as ``user``; the message says why.
+    exceptions.APINotSupportedError: If a request is sent in the context
+        to an API server that does not support impersonation.
 
 ### `sky.kubernetes_label_gpus`
 
@@ -1304,7 +1469,7 @@ Tears down the Kubernetes cluster started by local_up.
 ### `sky.local_up`
 
 ```python
-sky.local_up(gpus: bool, name: Optional[str] = None, port_start: Optional[int] = None) -> server_common.RequestId[None]
+sky.local_up(gpus: bool, name: Optional[str] = None, port_start: Optional[int] = None, num_nodes: int = 1) -> server_common.RequestId[None]
 ```
 
 Launches a Kubernetes cluster on local machines.
@@ -1406,7 +1571,7 @@ as managed jobs or services.
 ### `sky.stream_response`
 
 ```python
-sky.stream_response(request_id: Optional[server_common.RequestId[T]], response: 'requests.Response', output_stream: Optional['io.TextIOBase'] = None, resumable: bool = False, get_result: bool = True) -> Optional[T]
+sky.stream_response(request_id: Optional[server_common.RequestId[T]], response: 'requests.Response', output_stream: Optional['io.TextIOBase'] = None, resumable: bool = False, get_result: bool = True, relay_rich_status: bool = False) -> Optional[T]
 ```
 
 Streams the response to the console.
@@ -1424,6 +1589,9 @@ Streams the response to the console.
     get_result: Whether to get the result of the request. This will
         typically be set to False for `--no-follow` flags as requests may
         continue to run for long periods of time without further streaming.
+    relay_rich_status: If True, forward encoded rich-status control payloads
+        verbatim to the output instead of rendering a local spinner. See
+        :func:`sky.utils.rich_utils.decode_rich_status`.
 
 ### `sky.tail_autostop_logs`
 

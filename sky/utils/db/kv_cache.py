@@ -1,6 +1,6 @@
 """Persistent KV cache, backed by a sqlite or postgres database."""
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 import sqlalchemy
 from sqlalchemy import exc as sqlalchemy_exc
@@ -116,6 +116,32 @@ def _escape_like(value: str) -> str:
 
 
 @metrics_lib.time_me
+def get_cache_entries_by_prefix(prefix: str) -> Dict[str, str]:
+    """Get all unexpired cache entries whose key starts with the given prefix.
+
+    One query for a whole key namespace, for callers that would otherwise
+    issue one ``get_cache_entry`` per key. Any SQL LIKE wildcards (%, _) in
+    *prefix* are escaped so they are matched literally.
+
+    Args:
+        prefix: The literal prefix to match against cache keys.
+
+    Returns:
+        Mapping from full key to value for every matching, unexpired entry.
+    """
+    escaped = _escape_like(prefix)
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        rows = session.execute(
+            sqlalchemy.select(
+                kv_cache_table.c.key, kv_cache_table.c.value).where(
+                    kv_cache_table.c.key.like(
+                        f'{escaped}%', escape=_LIKE_ESCAPE_CHAR)).where(
+                            kv_cache_table.c.expires_at > time.time()))
+        return {key: value for key, value in rows}
+
+
+@metrics_lib.time_me
 def delete_cache_entries_by_prefix(prefix: str) -> None:
     """Delete all cache entries whose key starts with the given prefix.
 
@@ -132,27 +158,4 @@ def delete_cache_entries_by_prefix(prefix: str) -> None:
             sqlalchemy.delete(kv_cache_table).where(
                 kv_cache_table.c.key.like(f'{escaped}%',
                                           escape=_LIKE_ESCAPE_CHAR)))
-        session.commit()
-
-
-@metrics_lib.time_me
-def delete_cache_entries_by_prefix_suffix(prefix: str, suffix: str) -> None:
-    """Delete all cache entries whose key starts with *prefix* and ends
-    with *suffix*, with any content in between.
-
-    Both *prefix* and *suffix* are treated as literal strings — any SQL
-    LIKE wildcards (%, _) they contain are escaped automatically.
-
-    Args:
-        prefix: Literal prefix to match against cache keys.
-        suffix: Literal suffix to match against cache keys.
-    """
-    escaped_prefix = _escape_like(prefix)
-    escaped_suffix = _escape_like(suffix)
-    pattern = f'{escaped_prefix}%{escaped_suffix}'
-    engine = _db_manager.get_engine()
-    with orm.Session(engine) as session:
-        session.execute(
-            sqlalchemy.delete(kv_cache_table).where(
-                kv_cache_table.c.key.like(pattern, escape=_LIKE_ESCAPE_CHAR)))
         session.commit()

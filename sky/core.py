@@ -1,5 +1,7 @@
 """SDK functions for cluster/job management."""
 import concurrent.futures
+import itertools
+import json
 import shlex
 import typing
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -25,10 +27,10 @@ from sky.backends import cloud_vm_ray_backend
 from sky.backends import task_codegen
 from sky.clouds import cloud as sky_cloud
 from sky.jobs.server import core as managed_jobs_core
-from sky.provision.kubernetes import constants as kubernetes_constants
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.schemas.api import responses
 from sky.server.requests import request_names
+from sky.server.requests.serializers import encoders
 from sky.skylet import autostop_lib
 from sky.skylet import constants
 from sky.skylet import job_lib
@@ -38,12 +40,14 @@ from sky.utils import common
 from sky.utils import common_utils
 from sky.utils import controller_utils
 from sky.utils import debug_utils
+from sky.utils import log_links
 from sky.utils import resources_utils
 from sky.utils import rich_utils
 from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.utils.kubernetes import kubernetes_deploy_utils
+from sky.workspaces import constants as workspace_constants
 from sky.workspaces import core as workspaces_core
 
 if typing.TYPE_CHECKING:
@@ -53,6 +57,9 @@ else:
     jobsv1_pb2 = adaptors_common.LazyImport('sky.schemas.generated.jobsv1_pb2')
 
 logger = sky_logging.init_logger(__name__)
+
+# History records cost_report processes at a time.
+_COST_REPORT_CHUNK_SIZE = 256
 
 # ======================
 # = Cluster Management =
@@ -200,7 +207,11 @@ def status(
         include_handle=include_handle)
 
     status_responses = []
+    workspaces = skypilot_config.get_nested(('workspaces',), {})
     for cluster in clusters:
+        if cluster.get('workspace') is not None:
+            cluster['workspace_name'] = skypilot_config.get_workspace_name(
+                cluster['workspace'], workspaces)
         try:
             status_responses.append(
                 responses.StatusResponse.model_validate(cluster))
@@ -339,7 +350,10 @@ def get_cluster_events(
             is specified.
         cluster_hash: Hash of the cluster. Cannot be specified if cluster_name
             is specified.
-        event_type: Type of events to retrieve ('STATUS_CHANGE' or 'DEBUG').
+        event_type: Type of events to retrieve (e.g. 'STATUS_CHANGE' or
+            'DEBUG'). Multiple types may be requested as a comma-separated
+            string (e.g. 'STATUS_CHANGE,LAUNCH_PROGRESS'); the results are
+            merged and ordered by timestamp.
         include_timestamps: If True, returns list of dicts with 'reason' and
             'transitioned_at' fields. If False, returns list of reason strings.
         limit: If specified, returns at most this many events (most recent).
@@ -351,11 +365,43 @@ def get_cluster_events(
             'transitioned_at' (unix timestamp) fields.
         Events are ordered from oldest to newest.
     """
-    event_type_enum = global_user_state.ClusterEventType(event_type)
+    event_type_enums = []
+    for event_type_str in event_type.split(','):
+        name = event_type_str.strip()
+        if not name:
+            continue
+        try:
+            event_type_enums.append(global_user_state.ClusterEventType(name))
+        except ValueError:
+            # A name this server does not know is dropped, not fatal. The
+            # callers are dashboards shipped separately from the server, so a
+            # newer one routinely asks for a type an older server has no rows
+            # of -- and raising there fails the whole request, taking the
+            # types it *could* have answered with it. Dropping degrades to
+            # "no rows of that type", which is also the truth.
+            logger.debug(f'Ignoring unknown cluster event type {name!r}.')
+    if not event_type_enums:
+        # Nothing valid at all is still an error rather than a silent empty
+        # answer: an empty type list translates to `type IN ()`, i.e. no
+        # events, which a caller would read as "this cluster has no history".
+        raise ValueError(f'No valid cluster event type in {event_type!r}.')
+    workspaces_filter = workspaces_core.get_readable_workspace_names()
+    if workspaces_filter is not None:
+        # Events are readable iff the cluster's history is. A denied caller
+        # gets the same answer as for a cluster that does not exist.
+        cluster_hash, workspace = (
+            global_user_state.get_cluster_history_workspace(
+                cluster_hash, cluster_name))
+        if workspace not in workspaces_filter:
+            if cluster_name is not None:
+                raise ValueError(f'Hash for cluster {cluster_name} not found.')
+            return []
+        # Read the hash that was checked, in case the name is reused meanwhile.
+        cluster_name = None
     return global_user_state.get_cluster_events(
         cluster_name=cluster_name,
         cluster_hash=cluster_hash,
-        event_type=event_type_enum,
+        event_type=event_type_enums,
         include_timestamps=include_timestamps,
         limit=limit)
 
@@ -385,11 +431,11 @@ def endpoints(cluster: str,
 
 
 @usage_lib.entrypoint
-def cost_report(
-        days: Optional[int] = None,
-        dashboard_summary_response: bool = False,
-        cluster_hashes: Optional[List[str]] = None,
-        cluster_names: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def cost_report(days: Optional[int] = None,
+                dashboard_summary_response: bool = False,
+                cluster_hashes: Optional[List[str]] = None,
+                cluster_names: Optional[List[str]] = None,
+                exclude_managed_clusters: bool = False) -> List[Dict[str, Any]]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Get all cluster cost reports, including those that have been downed.
 
@@ -409,6 +455,7 @@ def cost_report(
             'total_cost': (float) cost given resources and usage intervals,
             'cloud': (str) cloud of the cluster,
             'region': (str) region of the cluster,
+            'zone': (str) zone of the cluster, if any,
             'cpus': (str) number of vCPUs of the cluster,
             'memory': (str) memory of the cluster,
             'accelerators': (str) accelerators of the cluster,
@@ -438,10 +485,15 @@ def cost_report(
             provided, rows matching either are returned (logical OR). Note
             that a single cluster name may map to multiple history records
             when the name is reused across launches.
+        exclude_managed_clusters: If True, exclude clusters launched by a
+            controller (managed jobs and services). Used by the dashboard so
+            that clusters backing managed jobs do not show up in the cluster
+            history view.
 
     Returns:
         A list of dicts, with each dict containing the cost information of a
-        cluster.
+        cluster. 'resources' is already encoded for the API response, and
+        sky.cost_report decodes it back to a resources.Resources.
     """
     if days is None:
         days = constants.COST_REPORT_DEFAULT_DAYS
@@ -449,13 +501,14 @@ def cost_report(
     abbreviate_response = (dashboard_summary_response and
                            cluster_hashes is None and cluster_names is None)
 
-    cluster_reports = global_user_state.get_clusters_from_history(
-        days=days,
-        abbreviate_response=abbreviate_response,
-        cluster_hashes=cluster_hashes,
-        cluster_names=cluster_names)
-    logger.debug(
-        f'{len(cluster_reports)} clusters found from history with {days} days.')
+    history = iter(
+        global_user_state.iter_clusters_from_history(
+            days=days,
+            abbreviate_response=abbreviate_response,
+            cluster_hashes=cluster_hashes,
+            cluster_names=cluster_names,
+            exclude_managed_clusters=exclude_managed_clusters,
+            workspaces_filter=workspaces_core.get_readable_workspace_names()))
 
     def _process_cluster_report(
             cluster_report: Dict[str, Any]) -> Dict[str, Any]:
@@ -465,8 +518,11 @@ def cost_report(
 
         def get_total_cost(cluster_report: dict) -> float:
             duration = cluster_report['duration']
-            launched_nodes = cluster_report['num_nodes']
             launched_resources = cluster_report['resources']
+            # launched_resources describes one task node (one slice for a
+            # multi-host TPU slice on Kubernetes, which has a pod per VM).
+            launched_nodes = kubernetes_utils.num_task_nodes(
+                cluster_report['num_nodes'], launched_resources)
 
             cost = (launched_resources.get_cost(duration) * launched_nodes)
             return cost
@@ -481,21 +537,30 @@ def cost_report(
 
         return report
 
-    # Process clusters in parallel
-    if not cluster_reports:
-        return []
-
-    if not abbreviate_response:
-        cluster_reports = subprocess_utils.run_in_parallel(
-            _process_cluster_report, cluster_reports)
-
-    for report in cluster_reports:
-        _update_record_with_resources(report, dashboard_summary_response)
-        if dashboard_summary_response:
-            report.pop('usage_intervals')
-            report.pop('user_hash')
-            report.pop('resources')
-
+    # Records are processed a chunk at a time, and each one's resources are
+    # encoded for the response as soon as its fields are derived, so only one
+    # chunk of unpickled resources is alive at a time.
+    cluster_reports: List[Dict[str, Any]] = []
+    while True:
+        chunk = list(itertools.islice(history, _COST_REPORT_CHUNK_SIZE))
+        if not chunk:
+            break
+        if not abbreviate_response:
+            # Process clusters in parallel
+            chunk = subprocess_utils.run_in_parallel(_process_cluster_report,
+                                                     chunk)
+        for report in chunk:
+            _update_record_with_resources(report, dashboard_summary_response)
+            if dashboard_summary_response:
+                report.pop('usage_intervals')
+                report.pop('user_hash')
+                report.pop('resources')
+            else:
+                report['resources'] = encoders.encode_resources(
+                    report['resources'])
+        cluster_reports.extend(chunk)
+    logger.debug(
+        f'{len(cluster_reports)} clusters found from history with {days} days.')
     return cluster_reports
 
 
@@ -509,12 +574,18 @@ def _update_record_with_resources(
     if resources is None:
         return
     if not dashboard_summary_response:
-        fields = ['cloud', 'region', 'cpus', 'memory', 'accelerators']
+        fields = ['cloud', 'region', 'zone', 'cpus', 'memory', 'accelerators']
     else:
-        fields = ['cloud']
+        # The dashboard builds the Infra cell as `cloud (zone-or-region)` for
+        # both live and terminated clusters, so the abbreviated payload needs
+        # the location fields but not the resource size fields.
+        fields = ['cloud', 'region', 'zone']
     for field in fields:
         try:
-            record[field] = str(getattr(resources, field))
+            value = getattr(resources, field)
+            # A None zone/region (zone-less clouds, legacy records) must not
+            # become the string 'None' in the payload.
+            record[field] = str(value) if value is not None else None
         except Exception as e:  # pylint: disable=broad-except
             # Ok to skip the fields as this is just for display
             # purposes.
@@ -656,7 +727,10 @@ def _start(
 
     with dag_lib.Dag():
         dummy_task = task_lib.Task().set_resources(handle.launched_resources)
-        dummy_task.num_nodes = handle.launched_nodes
+        # num_nodes counts task nodes: one per slice for a multi-host TPU
+        # slice on Kubernetes, whose cluster has one node per VM.
+        dummy_task.num_nodes = kubernetes_utils.num_task_nodes(
+            handle.launched_nodes, handle.launched_resources)
     (handle, _) = backend.provision(dummy_task,
                                     to_provision=handle.launched_resources,
                                     dryrun=False,
@@ -799,7 +873,16 @@ def _graceful_job_cancel(handle: backends.ResourceHandle,
     if timeout:
         flush_script = f'timeout {timeout} bash -c {shlex.quote(flush_script)}'
 
-    runners = handle.get_command_runners()
+    try:
+        runners = handle.get_command_runners()
+    except Exception as e:  # pylint: disable=broad-except
+        # Not every provisioner can produce command runners (e.g. a runtime
+        # that offers no exec access into the instances). Skip the flush
+        # instead of propagating, so the caller can still tear the cluster
+        # down; otherwise its resources would be leaked.
+        logger.warning('Skipping MOUNT_CACHED upload flush on '
+                       f'{cluster_name!r}: failed to get command runners: {e}')
+        return
     node_args = [(i, runner) for i, runner in enumerate(runners)]
     errors = []
     logger.debug(f'Waiting for uploads on {len(runners)} node(s)...')
@@ -840,11 +923,35 @@ def _graceful_job_cancel(handle: backends.ResourceHandle,
         logger.debug(f'All MOUNT_CACHED uploads completed on {cluster_name!r}')
 
 
+def _user_action_event_reason(action: str) -> str:
+    """The cluster-event reason for a user-requested lifecycle action.
+
+    Names the requesting user and the API request that carried the action
+    when they are known, so the cluster's event log records who stopped or
+    terminated a cluster -- the attribution the managed-job event log keeps
+    for a cancellation. Falls back to the plain text when there is no request
+    context to name (an in-process caller).
+    """
+    actor = common_utils.get_current_request_actor()
+    prefix = global_user_state.user_action_event_prefix(action)
+    if actor is None:
+        return f'{prefix}.'
+    return f'{prefix} {actor}.'
+
+
+def user_initiated_down(cluster_name: str,
+                        purge: bool = False,
+                        graceful: bool = False,
+                        graceful_timeout: Optional[int] = None) -> None:
+    down(cluster_name, purge, graceful, graceful_timeout, user_initiated=True)
+
+
 @usage_lib.entrypoint
 def down(cluster_name: str,
          purge: bool = False,
          graceful: bool = False,
-         graceful_timeout: Optional[int] = None) -> None:
+         graceful_timeout: Optional[int] = None,
+         user_initiated: bool = False) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Tears down a cluster.
 
@@ -876,6 +983,15 @@ def down(cluster_name: str,
     if handle is None:
         raise exceptions.ClusterDoesNotExist(
             f'Cluster {cluster_name!r} does not exist.')
+
+    if user_initiated:
+        # Record the event before teardown, while the cluster row still exists
+        # so its hash can be resolved (teardown deletes the row). There is no
+        # TERMINATED cluster status, so new_status is None.
+        global_user_state.add_cluster_event(
+            cluster_name, None, _user_action_event_reason('terminated'),
+            global_user_state.ClusterEventType.STATUS_CHANGE)
+
     backend = backend_utils.get_backend_from_handle(handle)
 
     if graceful:
@@ -1013,11 +1129,6 @@ def stop(cluster_name: str,
         raise exceptions.ClusterDoesNotExist(
             f'Cluster {cluster_name!r} does not exist.')
 
-    global_user_state.add_cluster_event(
-        cluster_name, status_lib.ClusterStatus.STOPPED,
-        'Cluster was stopped by user.',
-        global_user_state.ClusterEventType.STATUS_CHANGE)
-
     backend = backend_utils.get_backend_from_handle(handle)
 
     if isinstance(backend, backends.CloudVmRayBackend):
@@ -1036,6 +1147,12 @@ def stop(cluster_name: str,
                 f'  {_stop_not_supported_message(handle.launched_resources)}.\n'
                 '  To terminate the cluster instead, run: '
                 f'{colorama.Style.BRIGHT}sky down {cluster_name}') from e
+
+    # After the check: a stop the cloud does not support never started.
+    global_user_state.add_cluster_event(
+        cluster_name, status_lib.ClusterStatus.STOPPED,
+        _user_action_event_reason('stopped'),
+        global_user_state.ClusterEventType.STATUS_CHANGE)
 
     if graceful:
         _graceful_job_cancel(handle,
@@ -1148,8 +1265,7 @@ def autostop(
             raise exceptions.NotSupportedError(
                 f'{colorama.Fore.YELLOW}{operation} on cluster '
                 f'{cluster_name!r}...skipped.{colorama.Style.RESET_ALL}\n'
-                f'  Auto{option_str} is not supported on {cloud!r} - '
-                f'see reason above.') from e
+                f'  {e}') from e
 
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
     hooks_list = (handle.launched_resources.hooks
@@ -1166,6 +1282,21 @@ def autostop(
 # ==================
 # = Job Management =
 # ==================
+
+
+def _annotate_job_links(jobs: List[Dict[str, Any]]) -> None:
+    """Compute each job's external links from its harvested-URL metadata.
+
+    Matching against the configured dashboard.external_links patterns happens
+    here, server-side, in one place. URLs are harvested into job metadata by the
+    cluster's skylet, so a link is surfaced even if no one streamed the logs.
+    """
+    patterns = log_links.get_patterns()
+    for job in jobs:
+        meta = job.get('metadata') or {}
+        urls = meta.get(log_links.EXTRACTED_URLS_METADATA_KEY)
+        job['links'] = (log_links.match_links(urls, patterns)
+                        if patterns and isinstance(urls, list) else {})
 
 
 def _get_job_queue(handle: backends.CloudVmRayResourceHandle,
@@ -1195,11 +1326,14 @@ def _get_job_queue(handle: backends.CloudVmRayResourceHandle,
                     'resources': job_info.resources,
                     'log_path': job_info.log_path,
                     'user_hash': job_info.username,
+                    'metadata': (json.loads(job_info.metadata)
+                                 if job_info.metadata else {}),
                 }
                 # Copied from job_lib.load_job_queue.
                 user = global_user_state.get_user(job_dict['user_hash'])
                 job_dict['username'] = user.name if user is not None else None
                 jobs.append(job_dict)
+            _annotate_job_links(jobs)
             return jobs
         except exceptions.SKYLET_GRPC_FALLBACK_ERRORS as e:
             logger.debug(f'gRPC failed, falling back to SSH: {e}')
@@ -1216,7 +1350,9 @@ def _get_job_queue(handle: backends.CloudVmRayResourceHandle,
         f'{handle.cluster_name}.',
         stderr=f'{jobs_payload + stderr}',
         stream_logs=True)
-    return job_lib.load_job_queue(jobs_payload)
+    jobs = job_lib.load_job_queue(jobs_payload)
+    _annotate_job_links(jobs)
+    return jobs
 
 
 @usage_lib.entrypoint
@@ -1269,6 +1405,30 @@ def queue(cluster_name: str,
 
     jobs = _get_job_queue(handle, backend, user_hash, all_jobs)
     return [responses.ClusterJobRecord.model_validate(job) for job in jobs]
+
+
+@usage_lib.entrypoint
+def cluster_job_spec(cluster_name: str,
+                     job_id: int) -> Optional[Dict[str, Any]]:
+    """Gets the task YAML and entrypoint a cluster job was submitted with.
+
+    Read from the API server's database, so it does not need the cluster to
+    be UP.
+
+    Args:
+        cluster_name: name of the cluster.
+        job_id: id of the job on the cluster.
+
+    Returns:
+        A dict with 'task_yaml' (str) and 'entrypoint' (str), or None if the
+        cluster does not exist or the job's spec was not recorded (e.g. it was
+        submitted by an older API server version, or to a cluster launched by
+        a jobs or serve controller).
+    """
+    cluster_hash = global_user_state.get_cluster_hash(cluster_name)
+    if cluster_hash is None:
+        return None
+    return global_user_state.get_cluster_job_spec(cluster_hash, job_id)
 
 
 @usage_lib.entrypoint
@@ -1397,10 +1557,24 @@ def tail_logs(cluster_name: str,
 
     """
     # Check the status of the cluster.
-    handle = backend_utils.check_cluster_available(
-        cluster_name,
-        operation='tailing logs',
-    )
+    try:
+        handle = backend_utils.check_cluster_available(
+            cluster_name,
+            operation='tailing logs',
+        )
+    except (exceptions.ClusterNotUpError, exceptions.ClusterDoesNotExist):
+        # The cluster is gone; if a log reader is registered, stream the logs
+        # back from the external store instead.
+        from sky import logs  # pylint: disable=import-outside-toplevel
+        reader = logs.get_log_reader()
+        if reader is not None:
+            returncode = reader.read_cluster_job_logs(cluster_name,
+                                                      job_id,
+                                                      follow=follow,
+                                                      tail=tail)
+            if returncode is not None:
+                return returncode
+        raise
     backend = backend_utils.get_backend_from_handle(handle)
 
     usage_lib.record_cluster_name_for_current_operation(cluster_name)
@@ -1557,12 +1731,25 @@ def storage_ls() -> List[responses.StorageRecord]:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Gets the storages.
 
+    Only storage in workspaces the calling user can read is returned, the
+    same as for clusters, managed jobs and volumes.
+
     Returns:
         List[responses.StorageRecord]: A list of storage records.
     """
-    storages = global_user_state.get_storage()
+    # Visibility, not usability: a read-only workspace's storage is listed.
+    # None (an admin) lists everything, storage in a workspace since removed
+    # from the config included.
+    storages = global_user_state.get_storage(
+        workspaces_filter=workspaces_core.get_readable_workspace_names())
+    users = global_user_state.get_users({
+        storage['user_hash']
+        for storage in storages
+        if storage['user_hash'] is not None
+    })
     storage_records = []
     for storage in storages:
+        user = users.get(storage['user_hash'])
         storage_records.append(
             responses.StorageRecord(
                 name=storage['name'],
@@ -1570,6 +1757,11 @@ def storage_ls() -> List[responses.StorageRecord]:
                 store=list(storage.pop('handle').sky_stores.keys()),
                 last_use=storage['last_use'],
                 status=storage['status'],
+                user_hash=storage['user_hash'],
+                user_name=user.name if user is not None else None,
+                workspace=storage['workspace'],
+                workspace_name=skypilot_config.get_workspace_name(
+                    storage['workspace']),
             ))
     return storage_records
 
@@ -1579,16 +1771,24 @@ def storage_delete(name: str) -> None:
     # NOTE(dev): Keep the docstring consistent between the Python API and CLI.
     """Deletes a storage.
 
+    The workspace is the authorization boundary, as for clusters: storage in
+    a workspace the caller cannot read is reported as missing, and storage
+    in one the caller can only read cannot be deleted.
+
     Raises:
         ValueError: If the storage does not exist.
+        exceptions.PermissionDeniedError: If the caller cannot write to the
+            storage's workspace.
     """
-    # TODO(zhwu): check the storage owner matches the current user
-    handle = global_user_state.get_handle_from_storage_name(name)
-    if handle is None:
+    record = global_user_state.get_storage_by_name(name)
+    readable_workspaces = workspaces_core.get_readable_workspace_names()
+    if record is None or (readable_workspaces is not None and
+                          record['workspace'] not in readable_workspaces):
         raise ValueError(f'Storage name {name!r} not found.')
-    else:
-        storage_object = data.Storage.from_handle(handle)
-        storage_object.delete()
+    workspaces_core.check_workspace_permission(common_utils.get_current_user(),
+                                               record['workspace'])
+    storage_object = data.Storage.from_handle(record['handle'])
+    storage_object.delete()
 
 
 # ===================
@@ -1596,12 +1796,22 @@ def storage_delete(name: str) -> None:
 # ===================
 @usage_lib.entrypoint
 def enabled_clouds(workspace: Optional[str] = None,
-                   expand: bool = False) -> List[str]:
+                   expand: bool = False,
+                   workspace_ref: Optional[str] = None) -> List[str]:
     if workspace is None:
         workspace = skypilot_config.get_active_workspace()
     else:
+        # A read: this only reports which clouds/contexts the workspace has
+        # enabled, so read access is the right level. Requiring write would
+        # deny a workspace the caller can legitimately see (read-only
+        # visibility for non-members), which in turn fails the whole
+        # `enabled_clouds_batch` fan-out below and empties the dashboard's
+        # "Enabled infra" column and Infra page.
         workspaces_core.check_workspace_permission(
-            common_utils.get_current_user(), workspace)
+            common_utils.get_current_user(),
+            workspace,
+            action=workspace_constants.WORKSPACE_ACTION_READ,
+            workspace_ref=workspace_ref)
     cached_clouds = global_user_state.get_cached_enabled_clouds(
         sky_cloud.CloudCapability.COMPUTE, workspace=workspace)
     with skypilot_config.local_active_workspace_ctx(workspace):
@@ -1631,6 +1841,17 @@ def enabled_clouds(workspace: Optional[str] = None,
 
 
 @usage_lib.entrypoint
+def enabled_clouds_for_request(workspace: Optional[str] = None,
+                               expand: bool = False) -> List[str]:
+    """`GET /enabled_clouds`: `workspace` is an id or a name."""
+    if workspace is None:
+        return enabled_clouds(expand=expand)
+    return enabled_clouds(
+        workspace=skypilot_config.resolve_workspace_ref(workspace),
+        expand=expand,
+        workspace_ref=workspace)
+
+
 def enabled_clouds_batch(workspaces: List[str],
                          expand: bool = False) -> Dict[str, List[str]]:
     """Returns enabled clouds for multiple workspaces in a single call.
@@ -1670,6 +1891,11 @@ def realtime_kubernetes_gpu_availability(
         - context (str): The Kubernetes context.
         - availability_list (List[models.RealtimeGpuAvailability]): A list
             of RealtimeGpuAvailability objects for that context.
+        Contexts without matching GPUs are left out, so the list is empty
+        when no queried context has one.
+
+    Raises:
+        ValueError: If every queried context is known to be unreachable.
     """
     if context is None:
         # Include contexts from both Kubernetes and SSH clouds
@@ -1683,6 +1909,20 @@ def realtime_kubernetes_gpu_availability(
             context_list = kubernetes_contexts
     else:
         context_list = [context]
+    unreachable: Dict[Optional[str], str] = {}
+    for ctx in context_list:
+        reason = kubernetes_utils.known_unreachable_reason(ctx)
+        if reason is not None:
+            unreachable[ctx] = reason
+    context_list = [ctx for ctx in context_list if ctx not in unreachable]
+    if unreachable:
+        skipped = ', '.join(
+            f'{ctx!r} ({reason})' for ctx, reason in unreachable.items())
+        logger.debug(f'Skipping unreachable Kubernetes contexts: {skipped}')
+    if not context_list and unreachable:
+        raise ValueError(' '.join(
+            f'Kubernetes context {ctx!r} is unreachable: {reason}.'
+            for ctx, reason in unreachable.items()))
 
     def _realtime_kubernetes_gpu_availability_single(
         context: Optional[str] = None,
@@ -1718,7 +1958,6 @@ def realtime_kubernetes_gpu_availability(
 
     availability_lists: List[Tuple[str,
                                    List[models.RealtimeGpuAvailability]]] = []
-    cumulative_count = 0
     parallel_queried = subprocess_utils.run_in_parallel(
         lambda ctx: _realtime_kubernetes_gpu_availability_single(
             context=ctx,
@@ -1726,31 +1965,12 @@ def realtime_kubernetes_gpu_availability(
             quantity_filter=quantity_filter), context_list)
 
     cloud_identity = 'ssh' if is_ssh else 'kubernetes'
-    cloud_identity_capital = 'SSH' if is_ssh else 'Kubernetes'
-
     for ctx, queried in zip(context_list, parallel_queried):
-        cumulative_count += len(queried)
         if len(queried) == 0:
             # don't add gpu results for clusters that don't have any
             logger.debug(f'No gpus found in {cloud_identity} cluster {ctx}')
             continue
         availability_lists.append((ctx, queried))
-
-    if cumulative_count == 0:
-        err_msg = f'No GPUs found in any {cloud_identity_capital} clusters. '
-        debug_msg = 'To further debug, run: sky check '
-        if name_filter is not None:
-            gpu_info_msg = f' {name_filter!r}'
-            if quantity_filter is not None:
-                gpu_info_msg += (' with requested quantity'
-                                 f' {quantity_filter}')
-            err_msg = (f'Resources{gpu_info_msg} not found '
-                       f'in {cloud_identity_capital} clusters. ')
-            debug_msg = (f'To show available accelerators on {cloud_identity}, '
-                         f' run: sky gpus list --cloud {cloud_identity} ')
-        full_err_msg = (err_msg + kubernetes_constants.NO_GPU_HELP_MESSAGE +
-                        debug_msg)
-        raise ValueError(full_err_msg)
     return availability_lists
 
 
@@ -1873,9 +2093,11 @@ def realtime_slurm_gpu_availability(
 @usage_lib.entrypoint
 def local_up(gpus: bool,
              name: Optional[str] = None,
-             port_start: Optional[int] = None) -> None:
+             port_start: Optional[int] = None,
+             num_nodes: int = 1) -> None:
     """Creates a local cluster."""
-    kubernetes_deploy_utils.deploy_local_cluster(name, port_start, gpus)
+    kubernetes_deploy_utils.deploy_local_cluster(name, port_start, gpus,
+                                                 num_nodes)
 
 
 def local_down(name: Optional[str] = None) -> None:
@@ -1901,7 +2123,8 @@ def create_debug_dump(request_ids: Optional[List[str]] = None,
                       cluster_names: Optional[List[str]] = None,
                       managed_job_ids: Optional[List[int]] = None,
                       recent_minutes: Optional[float] = None,
-                      client_info: Optional[Dict[str, Any]] = None) -> str:
+                      client_info: Optional[Dict[str, Any]] = None,
+                      overall_deadline: Optional[float] = None) -> str:
     """Create a debug dump for troubleshooting.
 
     Args:
@@ -1911,6 +2134,12 @@ def create_debug_dump(request_ids: Optional[List[str]] = None,
         recent_minutes: If specified, include all resources active within
             this many minutes.
         client_info: Optional client-side info to include in the dump.
+        overall_deadline: Optional absolute wall-clock (time.time()) instant to
+            stop the whole collection by; when reached, collection stops early
+            and a partial dump is returned. Passing an absolute deadline lets an
+            out-of-process caller charge already-elapsed time (e.g. executor
+            queue wait) against the budget rather than ignoring it. None means
+            no deadline.
 
     Returns:
         Path to the created zip file on the server.
@@ -1928,7 +2157,8 @@ def create_debug_dump(request_ids: Optional[List[str]] = None,
         cluster_names=cluster_names,
         managed_job_ids=managed_job_ids,
         recent_minutes=recent_minutes,
-        client_info=client_info)
+        client_info=client_info,
+        overall_deadline=overall_deadline)
     logger.info('Debug dump created')
     logger.debug(f'Debug dump path on API server: {debug_dump_path}')
     return str(debug_dump_path)

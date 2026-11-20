@@ -1,7 +1,7 @@
 .. _api-server-auth:
 
-Authentication and RBAC
-=========================
+Authentication (SSO) and RBAC
+=============================
 
 SkyPilot API server supports two authentication methods:
 

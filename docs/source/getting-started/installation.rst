@@ -377,8 +377,8 @@ Slurm
 
 .. note::
 
-    Slurm support is under active development. We'd love to hear from you —
-    please `fill out this form <https://forms.gle/rfdWQcd9oQgp41Hm8>`_.
+    Have questions or feedback on running SkyPilot with Slurm? We'd love to
+    hear from you — please `fill out this form <https://forms.gle/rfdWQcd9oQgp41Hm8>`_.
 
 SkyPilot can run workloads on Slurm clusters. The only requirement is SSH access to a Slurm login node.
 
@@ -566,11 +566,11 @@ Install the necessary dependencies for Azure.
       # SkyPilot requires 3.7 <= python <= 3.13.
       # From stable release
       # Azure CLI has an issue with uv, and requires '--prerelease allow'.
-      uv pip install --prerelease allow azure-cli
+      uv pip install --prerelease allow "azure-cli<2.87.0"
       uv pip install "skypilot[azure]"
       # From nightly build
       # Azure CLI has an issue with uv, and requires '--prerelease allow'.
-      uv pip install --prerelease allow azure-cli
+      uv pip install --prerelease allow "azure-cli<2.87.0"
       uv pip install "skypilot-nightly[azure]"
 
   .. tab-item:: uv tool
@@ -852,6 +852,58 @@ In the prompt, enter your Nebius Access Key ID and Secret Access Key (see `instr
   aws configure set region <REGION> --profile nebius
   aws configure set endpoint_url <ENDPOINT>  --profile nebius
 
+Together AI
+~~~~~~~~~~~
+
+`Together AI <https://together.ai/>`_ offers Together *GPU clusters*. Accessing them is similar to using :ref:`Kubernetes <kubernetes-installation>`:
+
+1. Install the necessary dependencies for Kubernetes.
+
+.. tab-set::
+  .. tab-item:: uv venv
+    :sync: uv-venv-tab
+
+    .. code-block:: shell
+
+      # SkyPilot requires 3.7 <= python <= 3.13.
+      # From stable release
+      uv pip install "skypilot[kubernetes]"
+      # From nightly build
+      uv pip install "skypilot-nightly[kubernetes]"
+
+  .. tab-item:: uv tool
+    :sync: uv-tool-tab
+
+    .. code-block:: shell
+
+      # SkyPilot requires 3.7 <= python <= 3.13.
+      # From stable release
+      uv tool install --with pip "skypilot[kubernetes]"
+      # From nightly build
+      uv tool install --with pip "skypilot-nightly[kubernetes]"
+
+  .. tab-item:: pip
+    :sync: pip-tab
+
+    .. code-block:: shell
+
+      # SkyPilot requires 3.7 <= python <= 3.13.
+      # From stable release
+      pip install "skypilot[kubernetes]"
+      # From nightly build
+      pip install "skypilot-nightly[kubernetes]"
+      # From source
+      pip install -e ".[kubernetes]"
+
+2. Launch a Together `GPU Cluster <https://api.together.ai/clusters/create>`_ with cluster type selected as Kubernetes
+3. Get the Kubernetes config for the cluster
+4. Save the kubeconfig to a file, e.g., ``./together.kubeconfig``
+5. Copy the kubeconfig to your ``~/.kube/config`` or merge the Kubernetes config with your existing kubeconfig file by running:
+
+.. code-block:: shell
+
+  KUBECONFIG=./together-kubeconfig:~/.kube/config kubectl config view --flatten > /tmp/merged_kubeconfig && mv /tmp/merged_kubeconfig ~/.kube/config
+
 RunPod |community-badge|
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -973,6 +1025,36 @@ By default, the provisioned nodes will be in the root `compartment <https://docs
       default:
         compartment_ocid: ocid1.compartment.oc1..aaaaaaaa......
 
+OCI also offers `Object Storage <https://www.oracle.com/cloud/storage/object-storage/>`__, which supports both a native API and an `S3-compatible API <https://docs.oracle.com/en-us/iaas/Content/Object/Tasks/s3compatibleapi.htm>`__.
+SkyPilot can download/upload data to OCI buckets and mount them as local filesystem on clusters launched by SkyPilot. To set up OCI Object Storage, first create a `Customer Secret Key <https://docs.oracle.com/en-us/iaas/Content/Identity/Tasks/managingcredentials.htm#create-secret-key>`_ from the OCI console.
+
+SkyPilot uses separate configuration files for OCI Object Storage to avoid conflicts with your AWS credentials. Run the following command to configure your OCI Object Storage credentials:
+
+.. code-block:: shell
+
+  AWS_SHARED_CREDENTIALS_FILE=~/.oci/s3.credentials aws configure --profile oci
+
+When prompted, enter your OCI Object Storage credentials:
+
+.. code-block:: text
+
+  AWS Access Key ID [None]: <your_access_key_id>
+  AWS Secret Access Key [None]: <your_secret_access_key>
+  Default region name [None]:
+  Default output format [None]: json
+
+Next, configure the endpoint URL for OCI Object Storage. Replace ``<namespace>`` and ``<region>`` with your tenancy's object storage namespace and region:
+
+.. code-block:: shell
+
+  AWS_CONFIG_FILE=~/.oci/s3.config aws configure set endpoint_url \
+    https://<namespace>.compat.objectstorage.<region>.oci.customer-oci.com --profile oci
+  AWS_CONFIG_FILE=~/.oci/s3.config aws configure set region <region> --profile oci
+
+.. note::
+
+  When the S3-compatible credential files (``~/.oci/s3.credentials`` and ``~/.oci/s3.config``) are present, SkyPilot will use the S3-compatible API for ``oci://`` storage, and the native OCI API key (``~/.oci/config``) is **not** required for storage operations. Without the S3-compatible credential files, SkyPilot falls back to the native OCI SDK path.
+
 Lambda Cloud |community-badge|
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -1022,59 +1104,6 @@ Go to the `API Keys <https://cloud.lambdalabs.com/api-keys>`_ page on your Lambd
 
   mkdir -p ~/.lambda_cloud
   echo "api_key = <your_api_key_here>" > ~/.lambda_cloud/lambda_keys
-
-Together AI |community-badge|
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-`Together AI <https://together.ai/>`_ offers GPU *instant clusters*. Accessing them is similar to using :ref:`Kubernetes <kubernetes-installation>`:
-
-1. Install the necessary dependencies for Kubernetes.
-
-.. tab-set::
-  .. tab-item:: uv venv
-    :sync: uv-venv-tab
-
-    .. code-block:: shell
-
-      # SkyPilot requires 3.7 <= python <= 3.13.
-      # From stable release
-      uv pip install "skypilot[kubernetes]"
-      # From nightly build
-      uv pip install "skypilot-nightly[kubernetes]"
-
-  .. tab-item:: uv tool
-    :sync: uv-tool-tab
-
-    .. code-block:: shell
-
-      # SkyPilot requires 3.7 <= python <= 3.13.
-      # From stable release
-      uv tool install --with pip "skypilot[kubernetes]"
-      # From nightly build
-      uv tool install --with pip "skypilot-nightly[kubernetes]"
-
-  .. tab-item:: pip
-    :sync: pip-tab
-
-    .. code-block:: shell
-
-      # SkyPilot requires 3.7 <= python <= 3.13.
-      # From stable release
-      pip install "skypilot[kubernetes]"
-      # From nightly build
-      pip install "skypilot-nightly[kubernetes]"
-      # From source
-      pip install -e ".[kubernetes]"
-
-2. Launch a Together `Instant Cluster <https://api.together.ai/clusters/create>`_ with cluster type selected as Kubernetes
-3. Get the Kubernetes config for the cluster
-4. Save the kubeconfig to a file, e.g., ``./together.kubeconfig``
-5. Copy the kubeconfig to your ``~/.kube/config`` or merge the Kubernetes config with your existing kubeconfig file by running:
-
-.. code-block:: shell
-
-  KUBECONFIG=./together-kubeconfig:~/.kube/config kubectl config view --flatten > /tmp/merged_kubeconfig && mv /tmp/merged_kubeconfig ~/.kube/config
-
 
 Paperspace |community-badge|
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1162,6 +1191,7 @@ Install the necessary dependencies for Vast.
     .. code-block:: shell
 
       # SkyPilot requires 3.7 <= python <= 3.13.
+      # Vast is not part of "skypilot[all]"; install the vast extra explicitly.
       # From stable release
       pip install "skypilot[vast]"
       # From nightly build
@@ -1705,6 +1735,67 @@ You can verify your credentials are set up correctly by running:
 .. code-block:: shell
 
   sky check vastdata
+
+.. _huggingface-installation:
+
+Hugging Face
+~~~~~~~~~~~~
+
+SkyPilot can use the `Hugging Face Hub <https://huggingface.co/docs/huggingface_hub>`__ as a storage backend. `Hugging Face Buckets <https://huggingface.co/docs/huggingface_hub/guides/buckets>`__ are supported for both read and write (``hf://buckets/<namespace>/<bucket_name>``), and Hub repos, datasets, and spaces are supported as read-only sources (``hf://<owner>/<model>``, ``hf://datasets/...``, ``hf://spaces/...``).
+
+Install the necessary dependencies for Hugging Face:
+
+.. tab-set::
+  .. tab-item:: uv venv
+    :sync: uv-venv-tab
+
+    .. code-block:: shell
+
+      # SkyPilot requires 3.7 <= python <= 3.13.
+      # From stable release
+      uv pip install "skypilot[huggingface]"
+      # From nightly build
+      uv pip install "skypilot-nightly[huggingface]"
+
+  .. tab-item:: uv tool
+    :sync: uv-tool-tab
+
+    .. code-block:: shell
+
+      # SkyPilot requires 3.7 <= python <= 3.13.
+      # From stable release
+      uv tool install --with pip "skypilot[huggingface]"
+      # From nightly build
+      uv tool install --with pip "skypilot-nightly[huggingface]"
+
+  .. tab-item:: pip
+    :sync: pip-tab
+
+    .. code-block:: shell
+
+      # SkyPilot requires 3.7 <= python <= 3.13.
+      # From stable release
+      pip install "skypilot[huggingface]"
+      # From nightly build
+      pip install "skypilot-nightly[huggingface]"
+      # From source
+      pip install -e ".[huggingface]"
+
+Authenticate with the Hugging Face Hub, either by logging in with the ``hf`` CLI or by setting the ``HF_TOKEN`` environment variable:
+
+.. code-block:: shell
+
+  # Option 1: log in interactively (writes ~/.cache/huggingface/token)
+  hf auth login
+
+  # Option 2: set a token directly (see https://huggingface.co/settings/tokens)
+  export HF_TOKEN=<your-token>
+
+You can verify your credentials are set up correctly by running:
+
+.. code-block:: shell
+
+  sky check huggingface
 
 
 Prime Intellect |community-badge|
