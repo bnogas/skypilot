@@ -751,18 +751,15 @@ def get_api_server_status(endpoint: Optional[str] = None) -> ApiServerInfo:
         set_api_cookie_jar(cookies, create_if_not_exists=True)
         return server_info
     except (requests.JSONDecodeError, AttributeError) as e:
-        # Check all URLs in the redirect chain including the final destination.
-        # CF Access redirects FROM the protected URL TO a login URL, so
-        # 'login' only appears in response.url, not in history URLs.
-        urls_to_check = [r.url for r in response.history] + [response.url]
-        for url in urls_to_check:
-            parsed = urllib.parse.urlparse(url)
-            # Strip query/fragment before logging — CF Access embeds JWTs there.
-            safe_url = parsed._replace(query='', fragment='').geturl()
-            logger.debug(f'Checking URL for auth redirect: {safe_url}')
-            if any(key in parsed.path for key in ['login', 'oauth2']):
-                logger.debug(f'URL {safe_url} looks like a login page, '
-                             'trying cookie flow.')
+        # Try to check if we got redirected to a login page.
+        for prev_response in response.history:
+            logger.debug(f'Previous response: {prev_response.url}')
+            # Heuristic: check if the url looks like a login page or
+            # oauth flow.
+            if any(key in prev_response.url for key in ['login', 'oauth2']):
+                logger.debug(f'URL {prev_response.url} looks like '
+                             'a login page or oauth flow, so try to '
+                             'get the cookie.')
                 return ApiServerInfo(status=ApiServerStatus.NEEDS_AUTH)
         logger.warning('Failed to parse API server response: '
                        f'{str(e)}')
